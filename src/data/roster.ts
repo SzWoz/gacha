@@ -9,10 +9,13 @@
 // ─────────────────────────────────────────────────────────────
 
 import portraits from 'virtual:portraits'
+import { AGENT_META } from './agentMeta'
 
 export type Rank = 'S' | 'A' | 'B'
-export type Element = 'Fire' | 'Ice' | 'Electric' | 'Physical' | 'Ether'
-export type Role = 'Attack' | 'Stun' | 'Anomaly' | 'Support' | 'Defense'
+export type Element =
+  | 'Fire' | 'Ice' | 'Electric' | 'Physical' | 'Ether'
+  | 'Frost' | 'Wind' | 'Lumiflux' | 'Auric Ink' | 'Honed Edge' | 'Genesis Flare'
+export type Role = 'Attack' | 'Stun' | 'Anomaly' | 'Support' | 'Defense' | 'Rupture' | 'Armorer'
 
 export interface Item {
   id: string
@@ -33,6 +36,12 @@ export const ELEMENT_COLORS: Record<Element, [string, string]> = {
   Electric: ['#4d7cff', '#b07cff'],
   Physical: ['#ffcc00', '#fff3a8'],
   Ether: ['#ff3ea5', '#7cffd4'],
+  Frost: ['#7fd6ff', '#eaf9ff'],
+  Wind: ['#3fe0a0', '#c8ffe4'],
+  Lumiflux: ['#ffd84d', '#fff8d1'],
+  'Auric Ink': ['#d4a84b', '#f3e2b5'],
+  'Honed Edge': ['#b8c4d8', '#ffffff'],
+  'Genesis Flare': ['#ff7a3d', '#ffd9a0'],
 }
 
 export const ELEMENT_GLYPH: Record<Element, string> = {
@@ -41,6 +50,12 @@ export const ELEMENT_GLYPH: Record<Element, string> = {
   Electric: 'ϟ',
   Physical: '■',
   Ether: '✦',
+  Frost: '❅',
+  Wind: '≋',
+  Lumiflux: '☀',
+  'Auric Ink': '✒',
+  'Honed Edge': '⟋',
+  'Genesis Flare': '✸',
 }
 
 export const RANK_COLOR: Record<Rank, string> = {
@@ -58,7 +73,7 @@ const KINDS: { dir: keyof typeof portraits; kind: Kind; title: string }[] = [
 ]
 
 /** Opcjonalne metadane per nazwa (nazwa pliku bez rozszerzenia). */
-const EXTRA: Record<string, Partial<Omit<Item, 'id' | 'name' | 'rank' | 'kind' | 'image'>>> = {}
+const EXTRA: Record<string, Partial<Omit<Item, 'id' | 'name' | 'rank' | 'kind' | 'image'>>> = AGENT_META
 
 const slug = (s: string) =>
   s
