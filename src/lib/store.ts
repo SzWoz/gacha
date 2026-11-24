@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { Banner } from '../data/roster'
+import type { Banner, BannerKind } from '../data/roster'
 import { PULL_COST, freshPity, pullOnce, type PityState, type PullResult } from './gacha'
 
-const KEY = 'signal-gacha:v1'
+const KEY = 'signal-gacha:v2'
 
 export interface HistoryEntry {
   t: number
@@ -15,7 +15,7 @@ export interface HistoryEntry {
 
 export interface SaveState {
   currency: number
-  pity: { limited: PityState; standard: PityState }
+  pity: Record<BannerKind, PityState>
   owned: Record<string, number>
   history: HistoryEntry[]
   totalPulls: number
@@ -24,7 +24,7 @@ export interface SaveState {
 
 const initial = (): SaveState => ({
   currency: 16000,
-  pity: { limited: freshPity(), standard: freshPity() },
+  pity: { limited: freshPity(), standard: freshPity(), gear: freshPity() },
   owned: {},
   history: [],
   totalPulls: 0,
@@ -35,7 +35,9 @@ function load(): SaveState {
   try {
     const raw = localStorage.getItem(KEY)
     if (!raw) return initial()
-    return { ...initial(), ...JSON.parse(raw) }
+    const parsed = JSON.parse(raw)
+    const base = initial()
+    return { ...base, ...parsed, pity: { ...base.pity, ...parsed.pity } }
   } catch {
     return initial()
   }

@@ -1,11 +1,14 @@
 // ─────────────────────────────────────────────────────────────
-//  ROSTER — edytuj śmiało.
-//  Obrazki: /public/<typ>/<ranga>-rank/<name>.png (lub .webp/.jpg),
-//  gdzie typ = agents | w-engines (gear) | bangboo — np.
-//  public/agents/S-rank/Jane Doe.png. Dopasowuje po `name`, potem po `id`.
-//  `image` może nadpisać: sama nazwa pliku w folderze rangi albo pełna
-//  ścieżka (/...). Bez obrazka karta generuje proceduralny portret.
+//  ROSTER — generowany automatycznie z plików w /public:
+//    public/agents/<ranga>-rank/<Imię>.png     → agenci
+//    public/w-engines/<ranga>-rank/<Nazwa>.png → W-Engines (gear)
+//    public/bangboo/<ranga>-rank/<Nazwa>.png   → Bangboo
+//  Nazwa pliku (bez rozszerzenia) = nazwa postaci. Wrzuć/usuń plik,
+//  a roster się zaktualizuje. Dodatkowe dane (element, rola, cytat…)
+//  można dopisać w EXTRA poniżej, po nazwie postaci.
 // ─────────────────────────────────────────────────────────────
+
+import portraits from 'virtual:portraits'
 
 export type Rank = 'S' | 'A' | 'B'
 export type Element = 'Fire' | 'Ice' | 'Electric' | 'Physical' | 'Ether'
@@ -46,44 +49,37 @@ export const RANK_COLOR: Record<Rank, string> = {
   B: '#3fa9ff',
 }
 
-const S = (o: Omit<Item, 'rank' | 'kind'>): Item => ({ ...o, rank: 'S', kind: 'agent' })
-const A = (o: Omit<Item, 'rank' | 'kind'>): Item => ({ ...o, rank: 'A', kind: 'agent' })
-const B = (id: string, name: string, title: string): Item => ({ id, name, title, rank: 'B', kind: 'gear' })
+type Kind = Item['kind']
 
-export const ITEMS: Item[] = [
-  // ── S-rank ─────────────────────────────────────────────
-  S({ id: 'vex', name: 'Vex Arclight', title: 'Overclock Duelist', element: 'Electric', role: 'Attack', faction: 'Static Saints', quote: 'Blink and you missed the whole fight.' }),
-  S({ id: 'marrow', name: 'Marrow', title: 'Furnace Queen', element: 'Fire', role: 'Attack', faction: 'Rust Syndicate', quote: 'Everything burns. I just pick the order.' }),
-  S({ id: 'yuki', name: 'Yuki Hanamori', title: 'Frostline Ronin', element: 'Ice', role: 'Attack', faction: 'Ninth Precinct', quote: 'One cut. Clean. Cold.' }),
-  S({ id: 'oro', name: 'Oro Blackbell', title: 'Iron Sentinel', element: 'Physical', role: 'Stun', faction: 'Velvet Union', quote: 'Lean on me. I don’t bend.' }),
-  S({ id: 'nyx', name: 'Nyx-07', title: 'Void Sampler', element: 'Ether', role: 'Anomaly', faction: 'Hollow Bureau', quote: 'Signal acquired. Reality optional.' }),
-  S({ id: 'calla', name: 'Calla Vane', title: 'Neon Conductor', element: 'Ether', role: 'Support', faction: 'Neon Hounds', quote: 'Stay on beat and nobody gets hurt.' }),
-  S({ id: 'drax', name: 'Drax Halberd', title: 'Riot Breaker', element: 'Fire', role: 'Stun', faction: 'Ninth Precinct', quote: 'Order is a fist. I am the fist.' }),
-
-  // ── A-rank ─────────────────────────────────────────────
-  A({ id: 'pip', name: 'Pip Rivets', title: 'Scrap Mechanic', element: 'Physical', role: 'Defense', faction: 'Rust Syndicate' }),
-  A({ id: 'luma', name: 'Luma', title: 'Glowstick Medic', element: 'Ether', role: 'Support', faction: 'Neon Hounds' }),
-  A({ id: 'kade', name: 'Kade Osric', title: 'Shock Courier', element: 'Electric', role: 'Stun', faction: 'Static Saints' }),
-  A({ id: 'fen', name: 'Fen Holloway', title: 'Ash Runner', element: 'Fire', role: 'Anomaly', faction: 'Hollow Bureau' }),
-  A({ id: 'sora', name: 'Sora Kiri', title: 'Mist Sniper', element: 'Ice', role: 'Attack', faction: 'Velvet Union' }),
-  A({ id: 'bram', name: 'Bram', title: 'Bouncer Bot', element: 'Physical', role: 'Stun', faction: 'Velvet Union' }),
-  A({ id: 'zia', name: 'Zia Coil', title: 'Wire Witch', element: 'Electric', role: 'Anomaly', faction: 'Neon Hounds' }),
-  A({ id: 'tess', name: 'Tess Rook', title: 'Patrol Cadet', element: 'Ice', role: 'Support', faction: 'Ninth Precinct' }),
-
-  // ── B-rank (gear / śmieci) ─────────────────────────────
-  B('g1', 'Rusty Pipe', 'Gear'),
-  B('g2', 'Street Tape', 'Gear'),
-  B('g3', 'Cheap Amp', 'Gear'),
-  B('g4', 'Bent Antenna', 'Gear'),
-  B('g5', 'Spare Battery', 'Gear'),
-  B('g6', 'Cracked Visor', 'Gear'),
-  B('g7', 'Lucky Dice', 'Gear'),
-  B('g8', 'Old Cassette', 'Gear'),
+const KINDS: { dir: keyof typeof portraits; kind: Kind; title: string }[] = [
+  { dir: 'agents', kind: 'agent', title: 'Agent' },
+  { dir: 'w-engines', kind: 'gear', title: 'W-Engine' },
+  { dir: 'bangboo', kind: 'bangboo', title: 'Bangboo' },
 ]
+
+/** Opcjonalne metadane per nazwa (nazwa pliku bez rozszerzenia). */
+const EXTRA: Record<string, Partial<Omit<Item, 'id' | 'name' | 'rank' | 'kind' | 'image'>>> = {}
+
+const slug = (s: string) =>
+  s
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+
+export const ITEMS: Item[] = KINDS.flatMap(({ dir, kind, title }) =>
+  (['S', 'A', 'B'] as Rank[]).flatMap((rank) =>
+    (portraits[dir][rank] ?? []).map((file): Item => {
+      const name = file.replace(/\.[^.]+$/, '')
+      return { id: `${kind}-${rank}-${slug(name)}`.toLowerCase(), name, title, rank, kind, image: file, ...EXTRA[name] }
+    }),
+  ),
+)
 
 export const byId = Object.fromEntries(ITEMS.map((i) => [i.id, i])) as Record<string, Item>
 
-export type BannerKind = 'limited' | 'standard'
+export type BannerKind = 'limited' | 'standard' | 'gear'
 
 export interface Banner {
   id: string
@@ -94,31 +90,62 @@ export interface Banner {
   featuredA?: string[]
   /** S-ranki dostępne gdy przegrasz 50/50 lub na stałym banerze */
   standardS: string[]
+  /** Pula A-rang (domyślnie wszystkie A-rangi) */
+  poolA?: string[]
   accent: string
 }
 
-const STANDARD_S = ['oro', 'nyx', 'calla', 'drax', 'yuki']
+const agentsOf = (rank: Rank) => ITEMS.filter((i) => i.kind === 'agent' && i.rank === rank)
+/** id agenta po nazwie (jeśli plik istnieje), inaczej kolejny z puli */
+const pickAgent = (rank: Rank, name: string, skip: string[] = []) =>
+  (agentsOf(rank).find((i) => i.name === name) ?? agentsOf(rank).find((i) => !skip.includes(i.id)))?.id
+
+const itemsOf = (rank: Rank, kinds: Kind[]) => ITEMS.filter((i) => i.rank === rank && kinds.includes(i.kind))
+const GEAR_KINDS: Kind[] = ['gear', 'bangboo']
+const gearS = itemsOf('S', GEAR_KINDS)
+const gearA = itemsOf('A', GEAR_KINDS)
+const findIn = (pool: Item[], name: string) => (pool.find((i) => i.name === name) ?? pool[0])?.id
+const gearFeaturedS = findIn(gearS, 'Deep Sea Visitor')
+const gearFeaturedA = [findIn(gearA, 'Steel Cushion'), findIn(gearA, 'Luckyboo')].filter((x, i, a): x is string => !!x && a.indexOf(x) === i)
+
+const STANDARD_S = agentsOf('S').map((i) => i.id)
+
+const lim1S = pickAgent('S', 'Jane Doe')
+const lim2S = pickAgent('S', 'Burnice White', [lim1S ?? ''])
+const lim1A = [pickAgent('A', 'Seth Lowell'), pickAgent('A', 'Soukaku')].filter((x): x is string => !!x)
+const lim2A = [pickAgent('A', 'Piper Wheel'), pickAgent('A', 'Ben Bigger')].filter((x): x is string => !!x)
 
 export const BANNERS: Banner[] = [
   {
-    id: 'lim-vex',
+    id: 'lim-1',
     kind: 'limited',
     name: 'Overclock Rush',
     subtitle: 'Exclusive Channel',
-    featuredS: 'vex',
-    featuredA: ['kade', 'zia'],
+    featuredS: lim1S,
+    featuredA: lim1A,
     standardS: STANDARD_S,
     accent: '#4d7cff',
   },
   {
-    id: 'lim-marrow',
+    id: 'lim-2',
     kind: 'limited',
     name: 'Furnace Heart',
     subtitle: 'Exclusive Channel',
-    featuredS: 'marrow',
-    featuredA: ['fen', 'pip'],
+    featuredS: lim2S,
+    featuredA: lim2A,
     standardS: STANDARD_S,
     accent: '#ff4d2e',
+  },
+  {
+    id: 'gear',
+    kind: 'gear',
+    name: 'Arsenal Signal',
+    subtitle: 'W-Engine & Bangboo Channel',
+    featuredS: gearFeaturedS,
+    featuredA: gearFeaturedA,
+    standardS: gearS.map((i) => i.id).filter((id) => id !== gearFeaturedS),
+    poolA: gearA.map((i) => i.id),
+    accent: '#3fd8ff',
   },
   {
     id: 'standard',

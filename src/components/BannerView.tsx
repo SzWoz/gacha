@@ -91,7 +91,7 @@ export function BannerView({ banner, setBanner, pity, currency, onPull }: Props)
               <div className="pity-box">
                 <PityBar label="S pity" value={pity.s} max={HARD_PITY_S} color={RANK_COLOR.S} soft={74} />
                 <PityBar label="A pity" value={pity.a} max={HARD_PITY_A} color={RANK_COLOR.A} />
-                {banner.kind === 'limited' && (
+                {banner.featuredS && (
                   <div className="guarantee">
                     Next S: <b className={pity.guaranteedS ? 'on' : ''}>{pity.guaranteedS ? 'GUARANTEED FEATURED' : '50 / 50'}</b>
                   </div>

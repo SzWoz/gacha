@@ -52,13 +52,13 @@ export function pullOnce(banner: Banner, pity: PityState, owned: Record<string, 
 
   if (rank === 'S') {
     pityAt = pity.s
-    if (banner.kind === 'limited' && banner.featuredS) {
+    if (banner.featuredS) {
       if (pity.guaranteedS || Math.random() < 0.5) {
         item = byId[banner.featuredS]
         featured = true
         pity.guaranteedS = false
       } else {
-        item = byId[pick(banner.standardS)]
+        item = byId[pick(banner.standardS.length ? banner.standardS : [banner.featuredS])]
         lost5050 = true
         pity.guaranteedS = true
       }
@@ -74,7 +74,7 @@ export function pullOnce(banner: Banner, pity: PityState, owned: Record<string, 
       featured = true
       pity.guaranteedA = false
     } else {
-      item = pick(A_AGENTS)
+      item = banner.poolA?.length ? byId[pick(banner.poolA)] : pick(A_AGENTS)
       if (banner.featuredA?.length) {
         featured = banner.featuredA.includes(item.id)
         pity.guaranteedA = !featured
