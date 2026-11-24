@@ -9,6 +9,9 @@
 // ─────────────────────────────────────────────────────────────
 
 import * as THREE from 'three'
+import { attackPose } from './attackPoses'
+import type { Flavor } from './styles'
+const DEFAULT_FLAVOR: Flavor = { tempo: 1, mirror: 1, flair: 0.5, stance: 0.5 }
 import type { GLTFLoaderPlugin, GLTFParser } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import type { AvatarState } from './avatar'
 
@@ -626,10 +629,6 @@ export function createBoneAnimator(model: THREE.Object3D, reference: THREE.Objec
       }
 
       // ataki — prawa ręka trzyma broń
-      const ease = (x: number) => {
-        const t = Math.min(1, Math.max(0, x))
-        return t * t * (3 - 2 * t)
-      }
       if (s.action === 'light' && s.ranged) {
         // celowanie: ręka z bronią wyprostowana na wysokości barku, odrzut przy strzale
         rate = 30
@@ -653,51 +652,10 @@ export function createBoneAnimator(model: THREE.Object3D, reference: THREE.Objec
         T.lThigh = 0.15
         T.rThigh = -0.15
         T.lKnee = T.rKnee = 0.15
-      } else if (s.action === 'light') {
-        rate = 40
-        const wind = ease(k / 0.28)
-        const hit = ease((k - 0.28) / 0.32)
-        const back = ease((k - 0.7) / 0.3)
-        if (s.combo === 2) {
-          // cios znad głowy oburącz
-          const raise = 2.9 * wind - 2.4 * hit
-          T.rPitch = T.lPitch = raise * (1 - back)
-          T.rElbow = T.lElbow = (0.5 - 0.3 * hit) * (1 - back) + 0.25 * back
-          T.lYaw = -0.35 * (1 - back)
-          T.rYaw = 0.35 * (1 - back)
-          T.lean = (-0.25 * wind + 0.65 * hit) * (1 - back)
-          T.lKnee = T.rKnee = 0.5 * hit * (1 - back)
-          T.lThigh = 0.35 * hit * (1 - back)
-          T.rThigh = -0.25 * hit * (1 - back)
-        } else {
-          // cięcie poziome: combo 0 z prawej na lewo, combo 1 odwrotnie
-          const dir = s.combo === 0 ? 1 : -1
-          const from = -1.3 * dir
-          const to = 1.0 * dir
-          const yaw = from * wind + (to - from) * hit
-          T.rPitch = (1.45 * wind) * (1 - back)
-          T.rYaw = yaw * (1 - back)
-          T.rElbow = (0.15 + 0.4 * (1 - hit)) * (1 - back)
-          T.twist = (from * 0.45 * wind + (to - from) * 0.45 * hit) * (1 - back)
-          T.lPitch = 0.5 * (1 - back)
-          T.lElbow = 1.2
-          T.lean = 0.18 * (1 - back)
-          T.lThigh = 0.4 * (1 - back)
-          T.rThigh = -0.3 * (1 - back)
-          T.lKnee = 0.35 * (1 - back)
-          T.rKnee = 0.25 * (1 - back)
-        }
-      } else if (s.action === 'heavy') {
-        rate = 30
-        // obrót z rozłożonymi rękami, na końcu przysiad
-        const open = ease(k / 0.2)
-        const land = ease((k - 0.75) / 0.25)
-        T.lOut = T.rOut = 0.9 * open * (1 - land * 0.6)
-        T.lPitch = T.rPitch = 0.3 * open
-        T.lElbow = T.rElbow = 0.1
-        T.lKnee = T.rKnee = 0.25 + 0.6 * land
-        T.lThigh = T.rThigh = 0.4 * land
-        T.lean = 0.35 * land
+      } else if ((s.action === 'light' || s.action === 'heavy') && s.style) {
+        rate = attackPose(T, { action: s.action, style: s.style, flavor: s.flavor ?? DEFAULT_FLAVOR, combo: s.combo, k })
+      } else if (s.action === 'light' || s.action === 'heavy') {
+        rate = attackPose(T, { action: s.action, style: 'blade', flavor: DEFAULT_FLAVOR, combo: s.combo, k })
       } else if (s.action === 'dodge') {
         rate = 40
         T.lThigh = 0.9
@@ -752,4 +710,29 @@ export function createBoneAnimator(model: THREE.Object3D, reference: THREE.Objec
       }
     },
   }
+}
+
+/** Chowa siatki broni, które po przypięciu nie są przy dłoni (leżą na ziemi / unoszą się obok postaci). */
+export function hideUnheldWeapons(model: THREE.Object3D, hands: THREE.Object3D[], maxDist: number) {
+  model.updateMatrixWorld(true)
+  const hp = hands.map((h) => h.getWorldPosition(new THREE.Vector3()))
+  const box = new THREE.Box3()
+  const c = new THREE.Vector3()
+  let hidden = 0
+  model.traverse((o) => {
+    const m = o as THREE.SkinnedMesh
+    if (!m.isMesh || !m.visible || !isWeaponMesh(m)) return
+    if (m.isSkinnedMesh) m.computeBoundingBox()
+    else if (!m.geometry.boundingBox) m.geometry.computeBoundingBox()
+    const bb = m.isSkinnedMesh ? m.boundingBox : m.geometry.boundingBox
+    if (!bb || bb.isEmpty()) return
+    box.copy(bb).applyMatrix4(m.matrixWorld)
+    // najbliższy punkt broni do dłoni (długa broń może mieć środek daleko od chwytu)
+    const d = Math.min(...hp.map((p) => box.clampPoint(p, c).distanceTo(p)))
+    if (d > maxDist) {
+      m.visible = false
+      hidden++
+    }
+  })
+  return hidden
 }

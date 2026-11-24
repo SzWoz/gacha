@@ -54,10 +54,10 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
             </span>
           </div>
           <div className="hud-cds">
-            <div className={`hud-cd ${hud && hud.special <= 0 ? 'ready' : ''}`}>
+            <div className={`hud-cd ${hud && hud.special <= 0 ? 'ready' : ''}`} title={hud?.superName}>
               <i style={{ height: `${spPct}%` }} />
               <b>K</b>
-              <small>{hud && hud.special > 0 ? hud.special.toFixed(1) : 'SPECIAL'}</small>
+              <small title={hud?.superName}>{hud && hud.special > 0 ? hud.special.toFixed(1) : 'SUPER'}</small>
             </div>
             <div className={`hud-cd ${hud && hud.dodge <= 0 ? 'ready' : ''}`}>
               <i style={{ height: `${hud ? (1 - hud.dodge / 0.8) * 100 : 100}%` }} />
@@ -84,6 +84,7 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
         </button>
         {!touch && (
           <div className="game-help">
+            <span><b>Klik</b> złap mysz · <b>Mysz</b>/<b>Q E</b> kamera</span>
             <span><b>WASD</b> ruch</span>
             <span><b>J</b>/<b>LPM</b> atak (combo ×3)</span>
             <span><b>K</b>/<b>PPM</b> specjalny</span>

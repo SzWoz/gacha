@@ -1,16 +1,38 @@
 import * as THREE from 'three'
 
 // ─────────────────────────────────────────────────────────────
-//  Neonowe miasto nocą: siatka ulic co BLOCK metrów, kwartały z
-//  budynkami, plac w centrum, latarnie, zaparkowane auta, billboardy.
-//  Zwraca prostokąty kolizji (AABB) i punkty spawnu na ulicach.
+//  Post-apo miasto za dnia: korytarze ulic między zrujnowanymi,
+//  zarośniętymi budynkami, małe place jako areny. Mapa z ASCII:
+//    '#' budynek (ściana)   '.' ulica   'P' plac   'S' start
+//  Wrogowie chodzą po siatce (flow field z BFS od gracza).
 // ─────────────────────────────────────────────────────────────
 
-export const CITY_HALF = 42 // połowa boku grywalnego obszaru
-const BLOCK = 14 // odstęp osi ulic
-const ROAD = 3 // połowa szerokości jezdni
-const WALK = 1.2 // chodnik
-const PLAZA = 9.5 // połowa boku placu w centrum
+const MAP = `
+##################
+#S.....#.......PP#
+#.####.#.#####.PP#
+#.#....#.....#...#
+#.#.#######..#.###
+#...#PPP..#..#...#
+###.#PPP..#.####.#
+#...#.....#......#
+#.###.##.###.###.#
+#.....#.....#..#.#
+#.#####.#P#.#..#.#
+#.#...#.#.#.##.#.#
+#...#.....#....#.#
+##.##.#.#####.##.#
+#PP...#.......#..#
+#PP.###.#####...##
+#.......#PPP.....#
+##################`
+  .trim()
+  .split('\n')
+
+export const CELL = 6
+const GW = MAP[0].length
+const GH = MAP.length
+export const CITY_HALF = (GW * CELL) / 2
 
 export interface Box {
   minX: number
@@ -19,23 +41,26 @@ export interface Box {
   maxZ: number
 }
 
-interface Building {
-  box: Box
-  height: number
-  mats: THREE.Material[]
-  fade: number
-}
-
 export interface City {
   boxes: Box[]
-  /** losowy punkt na jezdni w odległości [min, max] od `from` */
+  start: THREE.Vector3
   spawnPoint(from: THREE.Vector3, min: number, max: number): THREE.Vector3
+  /** kierunek ruchu wroga do celu (omija ściany) */
+  steer(from: THREE.Vector3, out: THREE.Vector3): THREE.Vector3
+  /** jak daleko kamera może odjechać od `target` w kierunku `dir`, zanim wejdzie w ścianę */
+  cameraDistance(target: THREE.Vector3, dir: THREE.Vector3, max: number): number
+  wallAt(x: number, z: number): boolean
   update(time: number, dt: number, player: THREE.Vector3, camera: THREE.Vector3): void
-  drawMinimap(ctx: CanvasRenderingContext2D, size: number, player: THREE.Vector3, facing: number, enemies: THREE.Vector3[]): void
+  drawMinimap(ctx: CanvasRenderingContext2D, size: number, player: THREE.Vector3, facing: number, enemies: THREE.Vector3[], camYaw?: number): void
   dispose(): void
 }
 
-const NEON = [0xff3ea5, 0x3fd8ff, 0x7cffd4, 0xffb800, 0xb07cff, 0xff6a2e]
+// ── siatka ──────────────────────────────────────────────────
+const wall = (i: number, j: number) => i < 0 || j < 0 || i >= GW || j >= GH || MAP[j][i] === '#'
+const cx = (i: number) => (i - GW / 2 + 0.5) * CELL
+const cz = (j: number) => (j - GH / 2 + 0.5) * CELL
+const ci = (x: number) => Math.floor(x / CELL + GW / 2)
+const cj = (z: number) => Math.floor(z / CELL + GH / 2)
 
 function rngFrom(seed: number) {
   let a = seed
@@ -47,553 +72,993 @@ function rngFrom(seed: number) {
   }
 }
 
-/** Tekstura okien: siatka prostokątów, część zapalona w ciepłych/zimnych barwach. */
-function windowTexture(rng: () => number, tint: string) {
+// ── tekstury proceduralne ───────────────────────────────────
+function canvasTex(w: number, h: number, draw: (g: CanvasRenderingContext2D) => void, repeat = true) {
   const c = document.createElement('canvas')
-  c.width = c.height = 256
-  const g = c.getContext('2d')!
-  g.fillStyle = '#000'
-  g.fillRect(0, 0, 256, 256)
-  const cols = 8
-  const rows = 8
-  for (let y = 0; y < rows; y++)
-    for (let x = 0; x < cols; x++) {
-      const r = rng()
-      if (r < 0.45) continue
-      g.fillStyle = r < 0.8 ? '#ffd9a0' : r < 0.93 ? tint : '#9fdcff'
-      g.globalAlpha = 0.35 + rng() * 0.65
-      g.fillRect(x * 32 + 6, y * 32 + 8, 20, 16)
+  c.width = w
+  c.height = h
+  draw(c.getContext('2d')!)
+  const t = new THREE.CanvasTexture(c)
+  t.colorSpace = THREE.SRGBColorSpace
+  if (repeat) t.wrapS = t.wrapT = THREE.RepeatWrapping
+  t.anisotropy = 4
+  return t
+}
+
+/** Beton z wybitymi oknami, zaciekami, pęknięciami i mchem przy dole. */
+function facadeTex(rng: () => number, base: string) {
+  return canvasTex(256, 256, (g) => {
+    g.fillStyle = base
+    g.fillRect(0, 0, 256, 256)
+    // szum betonu
+    for (let i = 0; i < 1800; i++) {
+      g.fillStyle = `rgba(${rng() < 0.5 ? '0,0,0' : '255,255,255'},${rng() * 0.06})`
+      g.fillRect(rng() * 256, rng() * 256, 2 + rng() * 5, 2 + rng() * 5)
     }
-  g.globalAlpha = 1
-  const tex = new THREE.CanvasTexture(c)
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping
-  tex.colorSpace = THREE.SRGBColorSpace
-  return tex
-}
-
-/** Box z UV skalowanymi do rozmiaru (okna nie rozciągają się na wysokich budynkach). */
-function buildingGeometry(w: number, h: number, d: number) {
-  const geo = new THREE.BoxGeometry(w, h, d)
-  const uv = geo.getAttribute('uv') as THREE.BufferAttribute
-  // kolejność ścian: +x, -x, +y, -y, +z, -z (po 4 wierzchołki)
-  const dims: [number, number][] = [
-    [d, h],
-    [d, h],
-    [0, 0],
-    [0, 0],
-    [w, h],
-    [w, h],
-  ]
-  for (let f = 0; f < 6; f++)
-    for (let i = 0; i < 4; i++) {
-      const k = f * 4 + i
-      const [su, sv] = dims[f]
-      uv.setXY(k, uv.getX(k) * (su / 3.2), uv.getY(k) * (sv / 3.2))
+    // okna (1 piętro = 128px wysokości tekstury → 3 m)
+    for (let y = 0; y < 2; y++)
+      for (let x = 0; x < 3; x++) {
+        const wx = x * 85 + 16
+        const wy = y * 128 + 30
+        const r = rng()
+        g.fillStyle = r < 0.15 ? '#3a3d42' : '#0d0f12' // zabite deską albo czarna dziura
+        g.fillRect(wx, wy, 52, 62)
+        if (r > 0.15 && rng() < 0.5) {
+          // resztki szyby
+          g.fillStyle = 'rgba(160,190,200,0.35)'
+          g.beginPath()
+          g.moveTo(wx, wy)
+          g.lineTo(wx + 20 + rng() * 30, wy)
+          g.lineTo(wx, wy + 20 + rng() * 30)
+          g.fill()
+        }
+        if (r < 0.15) {
+          g.fillStyle = '#5a4a36'
+          for (let k = 0; k < 3; k++) g.fillRect(wx - 4, wy + 8 + k * 20, 60, 8)
+        }
+        g.strokeStyle = 'rgba(0,0,0,0.5)'
+        g.lineWidth = 4
+        g.strokeRect(wx - 2, wy - 2, 56, 66)
+      }
+    // gzymsy pięter
+    g.fillStyle = 'rgba(0,0,0,0.18)'
+    g.fillRect(0, 124, 256, 6)
+    g.fillRect(0, 252, 256, 4)
+    // zacieki
+    for (let i = 0; i < 9; i++) {
+      const x = rng() * 256
+      const grd = g.createLinearGradient(0, 0, 0, 256)
+      grd.addColorStop(0, 'rgba(40,30,20,0.35)')
+      grd.addColorStop(1, 'rgba(40,30,20,0)')
+      g.fillStyle = grd
+      g.fillRect(x, 0, 3 + rng() * 8, 80 + rng() * 170)
     }
-  geo.translate(0, h / 2, 0)
-  return geo
+    // pęknięcia
+    g.strokeStyle = 'rgba(20,20,20,0.5)'
+    g.lineWidth = 1.5
+    for (let i = 0; i < 5; i++) {
+      let x = rng() * 256
+      let y = rng() * 256
+      g.beginPath()
+      g.moveTo(x, y)
+      for (let k = 0; k < 6; k++) {
+        x += (rng() - 0.5) * 30
+        y += rng() * 25
+        g.lineTo(x, y)
+      }
+      g.stroke()
+    }
+  })
 }
 
-function signTexture(text: string, color: string) {
-  const c = document.createElement('canvas')
-  c.width = 512
-  c.height = 128
-  const g = c.getContext('2d')!
-  g.fillStyle = 'rgba(0,0,0,0.85)'
-  g.fillRect(0, 0, 512, 128)
-  g.strokeStyle = color
-  g.lineWidth = 8
-  g.strokeRect(8, 8, 496, 112)
-  g.font = 'bold 72px Impact, sans-serif'
-  g.textAlign = 'center'
-  g.textBaseline = 'middle'
-  g.shadowColor = color
-  g.shadowBlur = 24
-  g.fillStyle = color
-  g.fillText(text, 256, 68)
-  const tex = new THREE.CanvasTexture(c)
-  tex.colorSpace = THREE.SRGBColorSpace
-  return tex
+/** Liście bluszczu z przezroczystością. */
+function ivyTex(rng: () => number) {
+  return canvasTex(
+    128,
+    256,
+    (g) => {
+      g.clearRect(0, 0, 128, 256)
+      for (let i = 0; i < 520; i++) {
+        const y = rng() ** 0.7 * 256
+        const spread = 20 + (y / 256) * 50
+        const x = 64 + (rng() - 0.5) * 2 * spread
+        const s = 4 + rng() * 7
+        const l = 22 + rng() * 22
+        g.fillStyle = `hsl(${85 + rng() * 40}, ${40 + rng() * 25}%, ${l}%)`
+        g.beginPath()
+        g.ellipse(x, y, s, s * 0.6, rng() * Math.PI, 0, Math.PI * 2)
+        g.fill()
+      }
+    },
+    false,
+  )
 }
 
-const SIGNS = ['RANDOM PLAY', 'HOLLOW', 'NEW ERIDU', 'ZERO', '24/7', 'NOODLES', 'ARCADE', 'BANGBOO', 'SIXTH ST', 'VIDEO', 'HOTEL', 'BAR']
+function grassBladeTex() {
+  return canvasTex(
+    64,
+    128,
+    (g) => {
+      g.clearRect(0, 0, 64, 128)
+      for (let i = 0; i < 14; i++) {
+        const x = 8 + Math.random() * 48
+        const h = 60 + Math.random() * 66
+        const lean = (Math.random() - 0.5) * 24
+        const grd = g.createLinearGradient(0, 128, 0, 128 - h)
+        grd.addColorStop(0, '#3d5a22')
+        grd.addColorStop(1, `hsl(${70 + Math.random() * 30}, 50%, ${45 + Math.random() * 15}%)`)
+        g.fillStyle = grd
+        g.beginPath()
+        g.moveTo(x - 3, 128)
+        g.quadraticCurveTo(x + lean * 0.5, 128 - h * 0.6, x + lean, 128 - h)
+        g.quadraticCurveTo(x + lean * 0.5 + 2, 128 - h * 0.6, x + 3, 128)
+        g.fill()
+      }
+    },
+    false,
+  )
+}
+
+function neonTex(text: string) {
+  return canvasTex(
+    512,
+    128,
+    (g) => {
+      g.fillStyle = 'rgba(20,18,24,0.9)'
+      g.fillRect(0, 0, 512, 128)
+      g.font = 'bold 76px Impact, sans-serif'
+      g.textAlign = 'center'
+      g.textBaseline = 'middle'
+      g.shadowColor = '#ff3ea5'
+      g.shadowBlur = 20
+      g.fillStyle = '#ff7ac4'
+      g.fillText(text, 256, 68)
+    },
+    false,
+  )
+}
+
+/** Wstrzykuje kołysanie na wietrze do materiału (wierzchołki wyżej ruszają się mocniej). */
+function addWind(mat: THREE.Material, uTime: { value: number }, strength: number, heightScale: number) {
+  mat.onBeforeCompile = (sh) => {
+    sh.uniforms.uTime = uTime
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', '#include <common>\nuniform float uTime;')
+      .replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+        {
+          vec4 wp = vec4(transformed, 1.0);
+          #ifdef USE_INSTANCING
+            wp = instanceMatrix * wp;
+          #endif
+          wp = modelMatrix * wp;
+          float h = clamp(position.y * ${heightScale.toFixed(3)}, 0.0, 1.0);
+          float gust = 0.6 + 0.4 * sin(uTime * 0.7 + wp.x * 0.05);
+          float w = sin(uTime * 2.2 + wp.x * 0.35 + wp.z * 0.27) * 0.6 + sin(uTime * 3.7 + wp.z * 0.5) * 0.4;
+          transformed.x += w * h * h * ${strength.toFixed(3)} * gust;
+          transformed.z += cos(uTime * 1.9 + wp.x * 0.3) * h * h * ${(strength * 0.5).toFixed(3)} * gust;
+        }`,
+      )
+  }
+  mat.customProgramCacheKey = () => `wind-${strength}-${heightScale}`
+}
+
+// ── budowa ──────────────────────────────────────────────────
 
 export function buildCity(scene: THREE.Scene, accent: THREE.Color): City {
-  const rng = rngFrom(1337)
+  const rng = rngFrom(2077)
   const disposables: { dispose(): void }[] = []
   const group = new THREE.Group()
   scene.add(group)
+  const uTime = { value: 0 }
   const boxes: Box[] = []
-  const buildings: Building[] = []
+  const walk: [number, number][] = []
+  let start = new THREE.Vector3()
+  for (let j = 0; j < GH; j++)
+    for (let i = 0; i < GW; i++) {
+      if (MAP[j][i] === '#') boxes.push({ minX: cx(i) - CELL / 2, maxX: cx(i) + CELL / 2, minZ: cz(j) - CELL / 2, maxZ: cz(j) + CELL / 2 })
+      else walk.push([i, j])
+      if (MAP[j][i] === 'S') start = new THREE.Vector3(cx(i), 0, cz(j))
+    }
+  const T = <X extends { dispose(): void }>(x: X) => (disposables.push(x), x)
 
-  // ── ziemia: jezdnie, pasy, przejścia, chodniki, plac ─────
-  const groundMat = new THREE.ShaderMaterial({
-    uniforms: { uTime: { value: 0 }, uAccent: { value: accent.clone() }, uB: { value: BLOCK }, uR: { value: ROAD }, uW: { value: WALK }, uP: { value: PLAZA } },
-    vertexShader: `varying vec2 vW; void main(){ vec4 w = modelMatrix*vec4(position,1.); vW = w.xz; gl_Position = projectionMatrix*viewMatrix*w; }`,
-    fragmentShader: `
-      uniform float uTime; uniform vec3 uAccent; uniform float uB; uniform float uR; uniform float uW; uniform float uP; varying vec2 vW;
-      float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
-      void main(){
-        vec2 cell = vW/uB; vec2 near = floor(cell+0.5)*uB;
-        vec2 d = abs(vW - near);            // odległość od osi najbliższych ulic
-        bool roadX = d.x < uR; bool roadZ = d.y < uR;
-        bool walk = !roadX && !roadZ && (d.x < uR+uW || d.y < uR+uW);
-        bool plaza = abs(vW.x) < uP && abs(vW.y) < uP;
-        float n = hash(floor(vW*4.));
-        vec3 col;
-        if (plaza) {
-          vec2 t = fract(vW/1.5); float grout = step(.94, max(t.x,t.y));
-          float rr = length(vW);
-          float ring = smoothstep(.12,0.,abs(fract(rr/3. - uTime*.08)-.5)-.38);
-          col = vec3(.11,.1,.14) + n*.02 - grout*.05 + uAccent*ring*.18 + uAccent*smoothstep(uP, uP-.3, max(abs(vW.x),abs(vW.y)))*0.;
-          float edge = smoothstep(.25, 0., abs(max(abs(vW.x),abs(vW.y)) - uP + .2));
-          col += uAccent*edge*.8;
-        } else if (roadX || roadZ) {
-          col = vec3(.05,.05,.065) + n*.015;
-          bool inter = roadX && roadZ;
-          if (!inter) {
-            float along = roadX ? vW.y : vW.x;
-            float across = roadX ? d.x : d.y;
-            // przerywana linia środkowa
-            float dash = step(.5, fract(along/3.));
-            col += vec3(.9,.75,.3) * step(across, .07) * dash * .8;
-            // linie krawędzi
-            col += vec3(.5) * step(abs(across - (uR-.25)), .04);
-            // przejścia dla pieszych przy skrzyżowaniach
-            float toInter = abs((roadX ? d.y : d.x));
-            float zebra = step(uR+.2, toInter) * step(toInter, uR+1.6) * step(.5, fract(across/.6));
-            col = mix(col, vec3(.75), zebra*.55);
+  // ── niebo z chmurami + słońce ────────────────────────────
+  const skyMat = T(
+    new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      depthWrite: false,
+      fog: false,
+      uniforms: { uTime },
+      vertexShader: `varying vec3 vD; void main(){ vD = normalize(position); gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+      fragmentShader: `
+        uniform float uTime; varying vec3 vD;
+        float h(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+        float n(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+          return mix(mix(h(i),h(i+vec2(1,0)),f.x), mix(h(i+vec2(0,1)),h(i+vec2(1,1)),f.x), f.y); }
+        float fbm(vec2 p){ float s=0., a=.5; for(int i=0;i<5;i++){ s+=a*n(p); p*=2.1; a*=.5; } return s; }
+        void main(){
+          float y = clamp(vD.y, -0.1, 1.);
+          vec3 top = vec3(.36,.58,.86), hor = vec3(.84,.86,.8);
+          vec3 col = mix(hor, top, pow(max(y,0.), .55));
+          vec3 sunDir = normalize(vec3(.45,.55,-.7));
+          float sd = max(dot(vD, sunDir), 0.);
+          col += vec3(1.,.9,.7) * (pow(sd, 900.)*4. + pow(sd, 12.)*.25);
+          if (y > 0.) {
+            vec2 uv = vD.xz / (y + .15) * 1.4 + vec2(uTime*.012, uTime*.004);
+            float c = smoothstep(.48, .78, fbm(uv));
+            col = mix(col, vec3(1.) * (.85 + .15*fbm(uv*2.+3.)), c * .85 * smoothstep(0., .25, y));
           }
-        } else if (walk) {
-          vec2 t = fract(vW/1.2); float grout = step(.95, max(t.x,t.y));
-          col = vec3(.16,.15,.19) + n*.02 - grout*.06;
-          float curb = smoothstep(.12, 0., min(abs(d.x-uR), abs(d.y-uR)));
-          col += uAccent*curb*.35;
-        } else {
-          col = vec3(.07,.065,.09) + n*.02; // pod budynkami / dziedzińce
-        }
-        float far = smoothstep(${(CITY_HALF + 18).toFixed(1)}, ${(CITY_HALF + 2).toFixed(1)}, max(abs(vW.x), abs(vW.y)));
-        gl_FragColor = vec4(col*mix(.25, 1., far), 1.);
-      }`,
-  })
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry(CITY_HALF * 4, CITY_HALF * 4), groundMat)
+          gl_FragColor = vec4(col, 1.);
+        }`,
+    }),
+  )
+  const sky = new THREE.Mesh(T(new THREE.SphereGeometry(180, 32, 16)), skyMat)
+  group.add(sky)
+
+  // ── ziemia: popękany asfalt + trawa + ziemia ─────────────
+  const groundMat = T(
+    new THREE.ShaderMaterial({
+      uniforms: { uCell: { value: CELL } },
+      vertexShader: `varying vec2 vW; void main(){ vec4 w = modelMatrix*vec4(position,1.); vW = w.xz; gl_Position = projectionMatrix*viewMatrix*w; }`,
+      fragmentShader: `
+        uniform float uCell; varying vec2 vW;
+        float h(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+        float n(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+          return mix(mix(h(i),h(i+vec2(1,0)),f.x), mix(h(i+vec2(0,1)),h(i+vec2(1,1)),f.x), f.y); }
+        float fbm(vec2 p){ float s=0., a=.5; for(int i=0;i<5;i++){ s+=a*n(p); p*=2.03; a*=.5; } return s; }
+        vec2 vor(vec2 p){ vec2 i=floor(p), f=fract(p); float d1=8., d2=8.;
+          for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++){ vec2 g=vec2(x,y); vec2 o=vec2(h(i+g), h(i+g+17.)); float d=length(g+o-f);
+            if(d<d1){ d2=d1; d1=d; } else if(d<d2) d2=d; }
+          return vec2(d1, d2); }
+        void main(){
+          float tone = fbm(vW*.35);
+          vec3 asph = mix(vec3(.42,.41,.4), vec3(.52,.5,.47), tone);
+          vec2 v = vor(vW*.45);
+          float crack = 1. - smoothstep(0., .06, v.y - v.x);
+          float grass = smoothstep(.5, .68, fbm(vW*.18 + 4.)) + crack * .6;
+          vec3 g1 = mix(vec3(.36,.5,.2), vec3(.52,.62,.28), fbm(vW*1.3));
+          vec3 col = mix(asph, vec3(.12,.12,.12), crack*.8);
+          col = mix(col, g1, clamp(grass, 0., 1.) * .85);
+          float dirt = smoothstep(.62, .8, fbm(vW*.11 + 9.));
+          col = mix(col, vec3(.38,.31,.22), dirt*.6);
+          // resztki pasów
+          float lane = step(abs(fract(vW.x/uCell)-.5), .012) * step(.5, fract(vW.y/3.)) * (1.-grass) * step(.45, n(vW*.2));
+          col = mix(col, vec3(.8,.74,.5), lane*.5);
+          gl_FragColor = vec4(col, 1.);
+          #include <fog_fragment>
+        }`,
+      fog: true,
+    }),
+  )
+  // fog w ShaderMaterial wymaga uniformów fog
+  Object.assign(groundMat.uniforms, THREE.UniformsUtils.clone(THREE.UniformsLib.fog))
+  groundMat.vertexShader = `#include <fog_pars_vertex>\n` + groundMat.vertexShader.replace('gl_Position = projectionMatrix*viewMatrix*w;', 'vec4 mvPosition = viewMatrix*w; gl_Position = projectionMatrix*mvPosition;\n#include <fog_vertex>\n')
+  groundMat.fragmentShader = `#include <fog_pars_fragment>\n` + groundMat.fragmentShader
+  const ground = new THREE.Mesh(T(new THREE.PlaneGeometry(CITY_HALF * 4, CITY_HALF * 4)), groundMat)
   ground.rotation.x = -Math.PI / 2
-  ground.receiveShadow = true
   group.add(ground)
-  const shadowGround = new THREE.Mesh(new THREE.PlaneGeometry(CITY_HALF * 2.4, CITY_HALF * 2.4), new THREE.ShadowMaterial({ opacity: 0.5 }))
+  const shadowGround = new THREE.Mesh(T(new THREE.PlaneGeometry(CITY_HALF * 2.4, CITY_HALF * 2.4)), T(new THREE.ShadowMaterial({ opacity: 0.38 })))
   shadowGround.rotation.x = -Math.PI / 2
   shadowGround.position.y = 0.01
   shadowGround.receiveShadow = true
   group.add(shadowGround)
-  disposables.push(groundMat, ground.geometry, shadowGround.geometry, shadowGround.material as THREE.Material)
 
-  // ── materiały budynków ───────────────────────────────────
-  const facades = [0x1b1a26, 0x221c2c, 0x141a24, 0x262330, 0x1a1f2a, 0x2a2026]
-  const winTex = NEON.map((c) => windowTexture(rng, '#' + new THREE.Color(c).getHexString()))
-  disposables.push(...winTex)
-  const roofMat = new THREE.MeshStandardMaterial({ color: 0x0e0d14, roughness: 0.9 })
-  disposables.push(roofMat)
-
-  const addBuilding = (cx: number, cz: number, w: number, d: number, h: number, collide = true) => {
-    const wi = Math.floor(rng() * winTex.length)
-    const mat = new THREE.MeshStandardMaterial({
-      color: facades[Math.floor(rng() * facades.length)],
-      roughness: 0.75,
-      metalness: 0.2,
-      emissive: 0xffffff,
-      emissiveMap: winTex[wi],
-      emissiveIntensity: 0.9 + rng() * 0.6,
-      transparent: true,
-    })
-    const geo = buildingGeometry(w, h, d)
-    const mesh = new THREE.Mesh(geo, mat)
-    mesh.position.set(cx, 0, cz)
-    mesh.castShadow = true
-    mesh.receiveShadow = true
-    group.add(mesh)
-    disposables.push(mat, geo)
-    const mats: THREE.Material[] = [mat]
-
-    // dach + gzyms w kolorze neonu
-    const neonC = NEON[Math.floor(rng() * NEON.length)]
-    const trimMat = new THREE.MeshBasicMaterial({ color: neonC, transparent: true })
-    const trimGeo = new THREE.BoxGeometry(w + 0.15, 0.12, d + 0.15)
-    const trim = new THREE.Mesh(trimGeo, trimMat)
-    trim.position.set(cx, h, cz)
-    group.add(trim)
-    mats.push(trimMat)
-    disposables.push(trimMat, trimGeo)
-
-    // nadbudówka na dachu / antena
-    if (h > 10 && rng() < 0.6) {
-      const rw = w * (0.3 + rng() * 0.3)
-      const rd = d * (0.3 + rng() * 0.3)
-      const rh = 1 + rng() * 2.5
-      const rgeo = new THREE.BoxGeometry(rw, rh, rd)
-      rgeo.translate(0, rh / 2, 0)
-      const r = new THREE.Mesh(rgeo, roofMat)
-      r.position.set(cx + (rng() - 0.5) * (w - rw), h, cz + (rng() - 0.5) * (d - rd))
-      r.castShadow = true
-      group.add(r)
-      disposables.push(rgeo)
-      if (rng() < 0.5) {
-        const ageo = new THREE.CylinderGeometry(0.04, 0.04, 3 + rng() * 3, 4)
-        ageo.translate(0, ageo.parameters.height / 2, 0)
-        const ant = new THREE.Mesh(ageo, roofMat)
-        ant.position.set(r.position.x, h + rh, r.position.z)
-        group.add(ant)
-        const blinkMat = new THREE.MeshBasicMaterial({ color: 0xff2244 })
-        const blinkGeo = new THREE.SphereGeometry(0.12, 8, 6)
-        const blink = new THREE.Mesh(blinkGeo, blinkMat)
-        blink.position.set(r.position.x, h + rh + ageo.parameters.height, r.position.z)
-        group.add(blink)
-        blinkers.push(blink)
-        disposables.push(ageo, blinkMat, blinkGeo)
-      }
-    }
-
-    // neonowy szyld na ścianie od strony ulicy
-    if (rng() < 0.55 && h > 5) {
-      const text = SIGNS[Math.floor(rng() * SIGNS.length)]
-      const col = '#' + new THREE.Color(neonC).getHexString()
-      const tex = signTexture(text, col)
-      const vertical = rng() < 0.4
-      const sw = vertical ? 1 : Math.min(w, d) * 0.8
-      const sh = vertical ? 3.2 : sw / 4
-      const smat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide })
-      const sgeo = new THREE.PlaneGeometry(vertical ? sh : sw, vertical ? sw : sh)
-      const sign = new THREE.Mesh(sgeo, smat)
-      if (vertical) sign.rotation.z = Math.PI / 2
-      // ściana zwrócona do najbliższej ulicy
-      const nx = Math.round(cx / BLOCK) * BLOCK - cx
-      const nz = Math.round(cz / BLOCK) * BLOCK - cz
-      const y = 3 + rng() * Math.min(6, h - 4)
-      if (Math.abs(nx) > Math.abs(nz)) {
-        sign.position.set(cx + Math.sign(nx) * (w / 2 + 0.06), y, cz)
-        sign.rotation.y = Math.sign(nx) * (Math.PI / 2)
-      } else {
-        sign.position.set(cx, y, cz + Math.sign(nz || 1) * (d / 2 + 0.06))
-        sign.rotation.y = nz < 0 ? Math.PI : 0
-      }
-      group.add(sign)
-      mats.push(smat)
-      disposables.push(tex, smat, sgeo)
-    }
-
-    const box = { minX: cx - w / 2, maxX: cx + w / 2, minZ: cz - d / 2, maxZ: cz + d / 2 }
-    if (collide) boxes.push(box)
-    buildings.push({ box, height: h, mats, fade: 1 })
-  }
-  const blinkers: THREE.Mesh[] = []
-
-  // ── kwartały ─────────────────────────────────────────────
-  const inner = BLOCK - 2 * (ROAD + WALK) // bok działki w kwartale
-  const centers: number[] = []
-  for (let c = -BLOCK * 2.5; c <= BLOCK * 2.5 + 0.01; c += BLOCK) centers.push(c)
-  for (const bx of centers)
-    for (const bz of centers) {
-      if (Math.abs(bx) < PLAZA && Math.abs(bz) < PLAZA) continue // plac
-      const edge = Math.abs(bx) > CITY_HALF - BLOCK / 2 || Math.abs(bz) > CITY_HALF - BLOCK / 2
-      const distC = Math.hypot(bx, bz)
-      const tall = 6 + distC * 0.25
-      const layout = edge ? 0 : Math.floor(rng() * 4)
-      const g = 0.4 // przerwa między budynkami
-      const H = () => tall * (0.6 + rng() * 0.9) + (edge ? 10 : 0)
-      if (layout === 0) addBuilding(bx, bz, inner, inner, H())
-      else if (layout === 1) {
-        const hw = (inner - g) / 2
-        addBuilding(bx - hw / 2 - g / 2, bz, hw, inner, H())
-        addBuilding(bx + hw / 2 + g / 2, bz, hw, inner, H())
-      } else if (layout === 2) {
-        const hw = (inner - g) / 2
-        for (const sx of [-1, 1]) for (const sz of [-1, 1]) addBuilding(bx + sx * (hw / 2 + g / 2), bz + sz * (hw / 2 + g / 2), hw, hw, H())
-      } else {
-        // dziedziniec z niskim budynkiem i wieżą
-        addBuilding(bx - inner * 0.22, bz, inner * 0.56, inner, H() * 0.5)
-        addBuilding(bx + inner * 0.3, bz + inner * 0.25, inner * 0.38, inner * 0.48, H() * 1.4)
-      }
-    }
-  // pierścień wieżowców za granicą mapy (tło, bez kolizji)
-  for (let i = -3; i <= 3; i++)
-    for (const s of [-1, 1]) {
-      const p = i * BLOCK
-      const o = s * (CITY_HALF + 9)
-      addBuilding(p, o, 10, 8, 26 + rng() * 22, false)
-      addBuilding(o, p, 8, 10, 26 + rng() * 22, false)
-    }
-
-  // ── plac: monument + ławki ───────────────────────────────
-  const monMat = new THREE.MeshStandardMaterial({ color: 0x2a2638, roughness: 0.4, metalness: 0.6 })
-  const baseGeo = new THREE.CylinderGeometry(2.2, 2.6, 0.8, 8)
-  baseGeo.translate(0, 0.4, 0)
-  const base = new THREE.Mesh(baseGeo, monMat)
-  base.castShadow = base.receiveShadow = true
-  group.add(base)
-  const crystalMat = new THREE.MeshStandardMaterial({ color: accent, emissive: accent, emissiveIntensity: 1.8, transparent: true, opacity: 0.9 })
-  const crystalGeo = new THREE.OctahedronGeometry(1, 0)
-  const crystal = new THREE.Mesh(crystalGeo, crystalMat)
-  crystal.scale.set(0.9, 2, 0.9)
-  crystal.position.y = 3.6
-  group.add(crystal)
-  const ringGeo = new THREE.TorusGeometry(1.8, 0.05, 8, 48)
-  const ringMat = new THREE.MeshBasicMaterial({ color: accent })
-  const rings = [0, 1].map((i) => {
-    const r = new THREE.Mesh(ringGeo, ringMat)
-    r.position.y = 3.6
-    r.rotation.x = Math.PI / 2 + i * 0.6
-    group.add(r)
-    return r
+  // ── zrujnowane budynki ───────────────────────────────────
+  const bases = ['#8d8a82', '#9a8f7e', '#7f8584', '#a39b8c', '#857a6e', '#8f9488']
+  const facadeMats = bases.map((b) => {
+    const tex = T(facadeTex(rng, b))
+    return T(new THREE.MeshStandardMaterial({ map: tex, roughness: 0.95, metalness: 0 }))
   })
-  const plazaLight = new THREE.PointLight(accent, 40, 16)
-  plazaLight.position.set(0, 4, 0)
-  group.add(plazaLight)
-  boxes.push({ minX: -2.4, maxX: 2.4, minZ: -2.4, maxZ: 2.4 })
-  disposables.push(monMat, baseGeo, crystalMat, crystalGeo, ringGeo, ringMat)
+  const slabMat = T(new THREE.MeshStandardMaterial({ color: 0x77736b, roughness: 1 }))
+  const rebarMat = T(new THREE.MeshStandardMaterial({ color: 0x5a3b28, roughness: 0.8, metalness: 0.5 }))
+  const mossMat = T(new THREE.MeshStandardMaterial({ color: 0x4d6b2a, roughness: 1 }))
+  const ivyMat = T(new THREE.MeshStandardMaterial({ map: T(ivyTex(rng)), transparent: true, alphaTest: 0.35, side: THREE.DoubleSide, roughness: 0.9 }))
+  addWind(ivyMat, uTime, 0.08, 0.15)
+  const rebarGeo = T(new THREE.CylinderGeometry(0.03, 0.03, 1, 4))
+  rebarGeo.translate(0, 0.5, 0)
 
-  const benchGeo = new THREE.BoxGeometry(2.4, 0.5, 0.7)
-  benchGeo.translate(0, 0.25, 0)
-  const benchMat = new THREE.MeshStandardMaterial({ color: 0x3a3346, roughness: 0.8 })
-  disposables.push(benchGeo, benchMat)
-  for (const [x, z, ry] of [
-    [-6, 0, Math.PI / 2],
-    [6, 0, Math.PI / 2],
-    [0, -6, 0],
-    [0, 6, 0],
-  ] as const) {
-    const b = new THREE.Mesh(benchGeo, benchMat)
-    b.position.set(x, 0, z)
-    b.rotation.y = ry
-    b.castShadow = true
-    group.add(b)
-    const hw = ry ? 0.35 : 1.2
-    const hd = ry ? 1.2 : 0.35
-    boxes.push({ minX: x - hw, maxX: x + hw, minZ: z - hd, maxZ: z + hd })
-  }
-
-  // ── latarnie (instancjonowane) ───────────────────────────
-  const lampSpots: THREE.Vector3[] = []
-  const lines: number[] = []
-  for (let c = -BLOCK * 3; c <= BLOCK * 3 + 0.01; c += BLOCK) lines.push(c)
-  for (const l of lines)
-    for (let t = -CITY_HALF + 4; t <= CITY_HALF - 4; t += 7) {
-      if (Math.abs(((t + BLOCK / 2) % BLOCK) - BLOCK / 2) < ROAD + 1) continue // nie na skrzyżowaniu
-      if (Math.abs(l) > CITY_HALF) continue
-      if (Math.abs(l) < PLAZA + 1 && Math.abs(t) < PLAZA + 1) continue // nie na placu
-      const off = ROAD + 0.5
-      lampSpots.push(new THREE.Vector3(l + off, 0, t), new THREE.Vector3(t, 0, l - off))
-    }
-  const poleGeo = new THREE.CylinderGeometry(0.07, 0.1, 4.2, 6)
-  poleGeo.translate(0, 2.1, 0)
-  const poleMat = new THREE.MeshStandardMaterial({ color: 0x2a2833, metalness: 0.6, roughness: 0.5 })
-  const bulbGeo = new THREE.BoxGeometry(0.7, 0.12, 0.25)
-  const bulbMat = new THREE.MeshBasicMaterial({ color: 0xffe2b0 })
-  const poles = new THREE.InstancedMesh(poleGeo, poleMat, lampSpots.length)
-  const bulbs = new THREE.InstancedMesh(bulbGeo, bulbMat, lampSpots.length)
-  const m4 = new THREE.Matrix4()
-  lampSpots.forEach((p, i) => {
-    m4.makeTranslation(p.x, 0, p.z)
-    poles.setMatrixAt(i, m4)
-    m4.makeTranslation(p.x, 4.2, p.z)
-    bulbs.setMatrixAt(i, m4)
-  })
-  poles.castShadow = true
-  group.add(poles, bulbs)
-  disposables.push(poleGeo, poleMat, bulbGeo, bulbMat)
-  // kilka prawdziwych świateł na skrzyżowaniach
-  for (const [x, z] of [
-    [BLOCK, BLOCK],
-    [-BLOCK, BLOCK],
-    [BLOCK, -BLOCK],
-    [-BLOCK, -BLOCK],
-    [BLOCK * 2, 0],
-    [-BLOCK * 2, 0],
-    [0, BLOCK * 2],
-    [0, -BLOCK * 2],
-  ]) {
-    const l = new THREE.PointLight(NEON[Math.floor(rng() * NEON.length)], 22, 14)
-    l.position.set(x, 5, z)
-    group.add(l)
-  }
-
-  // ── zaparkowane auta (przeszkody) ────────────────────────
-  const carBodyGeo = new THREE.BoxGeometry(1.8, 0.7, 4)
-  carBodyGeo.translate(0, 0.55, 0)
-  const carTopGeo = new THREE.BoxGeometry(1.6, 0.55, 2)
-  carTopGeo.translate(0, 1.15, -0.2)
-  const lightGeo = new THREE.BoxGeometry(1.5, 0.12, 0.05)
-  const headMat = new THREE.MeshBasicMaterial({ color: 0xfff2d0 })
-  const tailMat = new THREE.MeshBasicMaterial({ color: 0xff2244 })
-  const glassMat = new THREE.MeshStandardMaterial({ color: 0x0b1220, metalness: 0.9, roughness: 0.1 })
-  disposables.push(carBodyGeo, carTopGeo, lightGeo, headMat, tailMat, glassMat)
-  const carColors = [0x8a1f2d, 0x1f3d8a, 0xd8d4c8, 0x222228, 0xc9a227, 0x2a7a5a]
-  const carMats = carColors.map((c) => new THREE.MeshStandardMaterial({ color: c, metalness: 0.7, roughness: 0.35 }))
-  disposables.push(...carMats)
-  let cars = 0
-  for (const l of lines) {
-    if (Math.abs(l) > CITY_HALF - 2) continue
-    for (let t = -CITY_HALF + 6; t <= CITY_HALF - 6; t += 5) {
-      if (rng() > 0.16 || cars > 34) continue
-      const toInter = Math.abs(((t + BLOCK / 2) % BLOCK + BLOCK) % BLOCK - BLOCK / 2)
-      if (toInter < ROAD + 2.5) continue
-      if (Math.abs(l) < PLAZA && Math.abs(t) < PLAZA + 2) continue
-      const alongZ = rng() < 0.5
-      const laneOff = (ROAD - 1.1) * (rng() < 0.5 ? 1 : -1)
-      const x = alongZ ? l + laneOff : t
-      const z = alongZ ? t : l + laneOff
-      const car = new THREE.Group()
-      const body = new THREE.Mesh(carBodyGeo, carMats[Math.floor(rng() * carMats.length)])
-      const top = new THREE.Mesh(carTopGeo, glassMat)
-      const head = new THREE.Mesh(lightGeo, headMat)
-      head.position.set(0, 0.6, 2.01)
-      const tail = new THREE.Mesh(lightGeo, tailMat)
-      tail.position.set(0, 0.6, -2.01)
-      body.castShadow = top.castShadow = true
-      car.add(body, top, head, tail)
-      car.position.set(x, 0, z)
-      car.rotation.y = (alongZ ? 0 : Math.PI / 2) + (rng() < 0.5 ? Math.PI : 0)
-      group.add(car)
-      const hw = alongZ ? 0.95 : 2.05
-      const hd = alongZ ? 2.05 : 0.95
-      boxes.push({ minX: x - hw, maxX: x + hw, minZ: z - hd, maxZ: z + hd })
-      cars++
-    }
-  }
-
-  // ── billboardy na dachach (świecą, zmieniają kolor) ──────
-  const boards: { mat: THREE.MeshBasicMaterial; phase: number }[] = []
-  const boardGeo = new THREE.PlaneGeometry(6, 2.4)
-  disposables.push(boardGeo)
-  for (const b of buildings) {
-    if (b.height < 14 || rng() > 0.25) continue
-    const tex = signTexture(SIGNS[Math.floor(rng() * SIGNS.length)], '#' + new THREE.Color(NEON[Math.floor(rng() * NEON.length)]).getHexString())
-    const mat = new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide, transparent: true })
-    const board = new THREE.Mesh(boardGeo, mat)
-    const cx = (b.box.minX + b.box.maxX) / 2
-    const cz = (b.box.minZ + b.box.maxZ) / 2
-    board.position.set(cx, b.height + 1.6, cz)
-    board.rotation.y = rng() * Math.PI
-    group.add(board)
-    b.mats.push(mat)
-    boards.push({ mat, phase: rng() * 10 })
-    disposables.push(tex, mat)
-  }
-
-  // ── deszcz neonowego pyłu nad miastem ────────────────────
-  const N = 600
-  const rain = new Float32Array(N * 3)
-  for (let i = 0; i < N; i++) rain.set([(rng() - 0.5) * 60, rng() * 20, (rng() - 0.5) * 60], i * 3)
-  const rainGeo = new THREE.BufferGeometry()
-  rainGeo.setAttribute('position', new THREE.BufferAttribute(rain, 3))
-  const rainMat = new THREE.PointsMaterial({ color: 0x9fdcff, size: 0.05, transparent: true, opacity: 0.55, depthWrite: false })
-  const rainPts = new THREE.Points(rainGeo, rainMat)
-  group.add(rainPts)
-  disposables.push(rainGeo, rainMat)
-
-  // ── API ──────────────────────────────────────────────────
-  const onRoad = (x: number, z: number) => {
-    const dx = Math.abs(x - Math.round(x / BLOCK) * BLOCK)
-    const dz = Math.abs(z - Math.round(z / BLOCK) * BLOCK)
-    return dx < ROAD - 0.6 || dz < ROAD - 0.6 || (Math.abs(x) < PLAZA - 1 && Math.abs(z) < PLAZA - 1)
-  }
-  const blocked = (x: number, z: number, r: number) => boxes.some((b) => x > b.minX - r && x < b.maxX + r && z > b.minZ - r && z < b.maxZ + r)
-
-  return {
-    boxes,
-    spawnPoint(from, min, max) {
-      const p = new THREE.Vector3()
-      for (let i = 0; i < 60; i++) {
-        const a = Math.random() * Math.PI * 2
-        const r = min + Math.random() * (max - min)
-        p.set(from.x + Math.cos(a) * r, 0, from.z + Math.sin(a) * r)
-        if (Math.abs(p.x) > CITY_HALF - 2 || Math.abs(p.z) > CITY_HALF - 2) continue
-        if (onRoad(p.x, p.z) && !blocked(p.x, p.z, 1.2)) return p
+  const scaleUV = (geo: THREE.BoxGeometry, w: number, h: number, d: number) => {
+    const uv = geo.getAttribute('uv') as THREE.BufferAttribute
+    const dims: [number, number][] = [
+      [d, h],
+      [d, h],
+      [w, d],
+      [w, d],
+      [w, h],
+      [w, h],
+    ]
+    for (let f = 0; f < 6; f++)
+      for (let i = 0; i < 4; i++) {
+        const k = f * 4 + i
+        uv.setXY(k, uv.getX(k) * (dims[f][0] / 6), uv.getY(k) * (dims[f][1] / 6))
       }
-      // awaryjnie: najbliższa ulica
-      p.set(Math.round(from.x / BLOCK) * BLOCK + (Math.random() - 0.5) * 4, 0, from.z + (Math.random() < 0.5 ? -min : min))
-      p.z = THREE.MathUtils.clamp(p.z, -CITY_HALF + 2, CITY_HALF - 2)
-      return p
-    },
-    update(time, dt, player, camera) {
-      groundMat.uniforms.uTime.value = time
-      crystal.rotation.y = time * 0.8
-      crystal.position.y = 3.6 + Math.sin(time * 1.5) * 0.25
-      rings[0].rotation.z = time * 0.6
-      rings[1].rotation.z = -time * 0.9
-      plazaLight.intensity = 34 + Math.sin(time * 3) * 8
-      for (const [i, b] of blinkers.entries()) b.visible = Math.sin(time * 3 + i) > 0
-      for (const b of boards) b.mat.color.setHSL((time * 0.05 + b.phase) % 1, 0.3, 0.9)
-      rainPts.position.set(player.x, 0, player.z)
-      const at = rainGeo.getAttribute('position') as THREE.BufferAttribute
-      for (let i = 0; i < N; i++) {
-        let y = at.getY(i) - dt * 6
-        if (y < 0) y += 20
-        at.setY(i, y)
-      }
-      at.needsUpdate = true
+  }
+  const box = (w: number, h: number, d: number, mat: THREE.Material, x: number, y: number, z: number, uv = true) => {
+    const geo = T(new THREE.BoxGeometry(w, h, d))
+    if (uv) scaleUV(geo, w, h, d)
+    const m = new THREE.Mesh(geo, mat)
+    m.position.set(x, y + h / 2, z)
+    m.castShadow = true
+    m.receiveShadow = true
+    group.add(m)
+    return m
+  }
 
-      // budynki zasłaniające gracza przed kamerą robią się półprzezroczyste
-      for (const b of buildings) {
-        const bx = b.box
-        const block =
-          bx.maxZ > player.z - 0.5 &&
-          bx.minZ < camera.z &&
-          bx.minX < player.x + 2.2 &&
-          bx.maxX > player.x - 2.2 &&
-          b.height > 1.5 + (camera.y - 1.5) * Math.max(0, (bx.minZ - player.z) / Math.max(0.1, camera.z - player.z)) - 0.5
-        const target = block ? 0.18 : 1
-        b.fade += (target - b.fade) * Math.min(1, dt * 8)
-        for (const m of b.mats) {
-          m.opacity = b.fade
-          m.depthWrite = b.fade > 0.95
+  const ivyGeo = T(new THREE.PlaneGeometry(2.2, 1))
+  ivyGeo.translate(0, -0.5, 0) // zaczepione u góry, zwisa w dół
+  for (let j = 0; j < GH; j++)
+    for (let i = 0; i < GW; i++) {
+      if (!wall(i, j)) continue
+      const x = cx(i)
+      const z = cz(j)
+      const border = i === 0 || j === 0 || i === GW - 1 || j === GH - 1
+      const mat = facadeMats[Math.floor(rng() * facadeMats.length)]
+      const H = border ? 12 + rng() * 14 : 6 + rng() * 13
+      const solid = H * (0.55 + rng() * 0.25)
+      box(CELL, solid, CELL, mat, x, 0, z)
+      // postrzępiona góra: 4 fragmenty o różnych wysokościach, część zawalona
+      for (const sx of [-1, 1])
+        for (const sz of [-1, 1]) {
+          if (rng() < 0.28) continue
+          const ph = (H - solid) * (0.3 + rng() * 0.7)
+          const w = CELL / 2 - rng() * 0.6
+          const d = CELL / 2 - rng() * 0.6
+          box(w, ph, d, mat, x + sx * CELL * 0.25, solid, z + sz * CELL * 0.25)
+          // pręty zbrojeniowe sterczące z ruin
+          if (rng() < 0.5)
+            for (let k = 0; k < 3; k++) {
+              const r = new THREE.Mesh(rebarGeo, rebarMat)
+              r.position.set(x + sx * CELL * 0.25 + (rng() - 0.5) * w, solid + ph, z + sz * CELL * 0.25 + (rng() - 0.5) * d)
+              r.scale.y = 0.6 + rng() * 1.4
+              r.rotation.set((rng() - 0.5) * 0.7, 0, (rng() - 0.5) * 0.7)
+              group.add(r)
+            }
+        }
+      // mech na dachu
+      box(CELL * 0.92, 0.08, CELL * 0.92, mossMat, x, solid, z, false).castShadow = false
+
+      // strony od ulicy: wystające stropy, bluszcz
+      const sides: [number, number][] = [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ]
+      for (const [dx, dz] of sides) {
+        if (wall(i + dx, j + dz)) continue
+        const along = dx === 0
+        // wystający strop na którymś piętrze (wysoko — nie blokuje ruchu)
+        if (rng() < 0.45 && solid > 6) {
+          const y = 3 * Math.floor(2 + rng() * Math.max(1, solid / 3 - 2))
+          const len = CELL * (0.4 + rng() * 0.5)
+          const slab = box(along ? len : 1.1, 0.25, along ? 1.1 : len, slabMat, x + dx * (CELL / 2 + 0.5), y, z + dz * (CELL / 2 + 0.5), false)
+          slab.rotation.set(along ? (rng() - 0.5) * 0.3 : 0, 0, along ? 0 : (rng() - 0.5) * 0.3)
+        }
+        // bluszcz zwisający z góry ściany
+        const n = 1 + Math.floor(rng() * 3)
+        for (let k = 0; k < n; k++) {
+          if (rng() < 0.3) continue
+          const len = solid * (0.35 + rng() * 0.6)
+          const ivy = new THREE.Mesh(ivyGeo, ivyMat)
+          const off = (rng() - 0.5) * (CELL - 2)
+          ivy.position.set(x + dx * (CELL / 2 + 0.04) + (along ? off : 0), solid - 0.1, z + dz * (CELL / 2 + 0.04) + (along ? 0 : off))
+          ivy.rotation.y = Math.atan2(dx, dz)
+          ivy.scale.set(0.8 + rng() * 0.8, len, 1)
+          ivy.castShadow = true
+          group.add(ivy)
         }
       }
+    }
+
+  // ── trawa (instancjonowana, kołysze się) ─────────────────
+  const grassTex = T(grassBladeTex())
+  const grassMat = T(new THREE.MeshStandardMaterial({ map: grassTex, transparent: true, alphaTest: 0.4, side: THREE.DoubleSide, roughness: 1 }))
+  addWind(grassMat, uTime, 0.25, 1.4)
+  const tuft = new THREE.PlaneGeometry(0.9, 0.75)
+  tuft.translate(0, 0.37, 0)
+  const tuft2 = tuft.clone().rotateY(Math.PI / 2)
+  const grassGeo = T(mergeGeos([tuft, tuft2]))
+  tuft.dispose()
+  tuft2.dispose()
+  const GRASS = 5200
+  const grass = new THREE.InstancedMesh(grassGeo, grassMat, GRASS)
+  const m4 = new THREE.Matrix4()
+  const q = new THREE.Quaternion()
+  const up = new THREE.Vector3(0, 1, 0)
+  let gi = 0
+  const nearWall = (x: number, z: number) => wall(ci(x + 0.9), cj(z)) || wall(ci(x - 0.9), cj(z)) || wall(ci(x), cj(z + 0.9)) || wall(ci(x), cj(z - 0.9))
+  for (let tries = 0; tries < GRASS * 4 && gi < GRASS; tries++) {
+    const [i, j] = walk[Math.floor(rng() * walk.length)]
+    const x = cx(i) + (rng() - 0.5) * CELL
+    const z = cz(j) + (rng() - 0.5) * CELL
+    // więcej trawy przy ścianach i na placach, mniej na środku jezdni
+    const dense = nearWall(x, z) || MAP[j][i] === 'P'
+    if (!dense && rng() < 0.6) continue
+    const s = 0.6 + rng() * (dense ? 1.1 : 0.6)
+    q.setFromAxisAngle(up, rng() * Math.PI)
+    m4.compose(new THREE.Vector3(x, 0, z), q, new THREE.Vector3(s, s * (0.8 + rng() * 0.6), s))
+    grass.setMatrixAt(gi++, m4)
+  }
+  grass.count = gi
+  grass.receiveShadow = true
+  group.add(grass)
+
+  // ── krzaki ───────────────────────────────────────────────
+  const bushGeo = T(new THREE.IcosahedronGeometry(0.7, 1))
+  const bushMat = T(new THREE.MeshStandardMaterial({ color: 0x4a6a28, roughness: 1, flatShading: true }))
+  addWind(bushMat, uTime, 0.06, 0.8)
+  const BUSH = 140
+  const bushes = new THREE.InstancedMesh(bushGeo, bushMat, BUSH)
+  const bushCol = new THREE.Color()
+  for (let b = 0; b < BUSH; b++) {
+    const [i, j] = walk[Math.floor(rng() * walk.length)]
+    // przy ścianie
+    const side = Math.floor(rng() * 4)
+    const off = (rng() - 0.5) * (CELL - 1)
+    const e = CELL / 2 - 0.6
+    const x = cx(i) + (side === 0 ? e : side === 1 ? -e : off)
+    const z = cz(j) + (side === 2 ? e : side === 3 ? -e : off)
+    const s = 0.7 + rng() * 1.1
+    m4.compose(new THREE.Vector3(x, s * 0.35, z), q.setFromAxisAngle(up, rng() * 6), new THREE.Vector3(s, s * 0.75, s))
+    bushes.setMatrixAt(b, m4)
+    bushes.setColorAt(b, bushCol.setHSL(0.22 + rng() * 0.08, 0.45, 0.22 + rng() * 0.12))
+  }
+  bushes.castShadow = true
+  bushes.receiveShadow = true
+  group.add(bushes)
+
+  // ── drzewa wyrastające z asfaltu (place) ─────────────────
+  const trunkMat = T(new THREE.MeshStandardMaterial({ color: 0x4b3a2a, roughness: 1 }))
+  const leafMat = T(new THREE.MeshStandardMaterial({ color: 0x55782c, roughness: 0.9, flatShading: true }))
+  addWind(leafMat, uTime, 0.18, 0.12)
+  const trunkGeo = T(new THREE.CylinderGeometry(0.18, 0.32, 4, 7))
+  trunkGeo.translate(0, 2, 0)
+  const crownGeo = T(new THREE.IcosahedronGeometry(1.6, 1))
+  const treeSpots: THREE.Vector3[] = []
+  const plazaCells = walk.filter(([i, j]) => MAP[j][i] === 'P')
+  for (const [i, j] of plazaCells) {
+    if (rng() < 0.45) continue
+    const x = cx(i) + (rng() - 0.5) * (CELL - 2.5)
+    const z = cz(j) + (rng() - 0.5) * (CELL - 2.5)
+    const t = new THREE.Group()
+    const s = 0.8 + rng() * 0.6
+    const trunk = new THREE.Mesh(trunkGeo, trunkMat)
+    trunk.castShadow = true
+    t.add(trunk)
+    for (let k = 0; k < 4; k++) {
+      const c = new THREE.Mesh(crownGeo, leafMat)
+      c.position.set((rng() - 0.5) * 2, 4 + rng() * 1.5, (rng() - 0.5) * 2)
+      c.scale.setScalar(0.7 + rng() * 0.6)
+      c.castShadow = true
+      t.add(c)
+    }
+    t.position.set(x, 0, z)
+    t.scale.setScalar(s)
+    t.rotation.y = rng() * 6
+    group.add(t)
+    treeSpots.push(t.position.clone())
+    boxes.push({ minX: x - 0.35 * s, maxX: x + 0.35 * s, minZ: z - 0.35 * s, maxZ: z + 0.35 * s })
+  }
+
+  // ── wraki aut (przeszkody) ───────────────────────────────
+  const rustMats = [0x7a4a2c, 0x5e5a52, 0x6b3b2b, 0x4f5c5a].map((c) => T(new THREE.MeshStandardMaterial({ color: c, roughness: 0.85, metalness: 0.35 })))
+  const glassMat = T(new THREE.MeshStandardMaterial({ color: 0x1a2226, roughness: 0.3, metalness: 0.6 }))
+  const tireMat = T(new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 1 }))
+  const carBody = T(new THREE.BoxGeometry(1.8, 0.75, 4.1))
+  carBody.translate(0, 0.6, 0)
+  const carTop = T(new THREE.BoxGeometry(1.6, 0.6, 2))
+  carTop.translate(0, 1.27, -0.15)
+  const tireGeo = T(new THREE.CylinderGeometry(0.35, 0.35, 0.25, 10))
+  tireGeo.rotateZ(Math.PI / 2)
+  const corridorCells = walk.filter(([i, j]) => MAP[j][i] === '.')
+  let cars = 0
+  for (const [i, j] of corridorCells) {
+    if (rng() > 0.13 || cars > 14) continue
+    const horiz = !wall(i - 1, j) || !wall(i + 1, j) // ulica biegnie wzdłuż X?
+    const x = cx(i) + (horiz ? (rng() - 0.5) * 2 : (rng() < 0.5 ? -1.6 : 1.6))
+    const z = cz(j) + (horiz ? (rng() < 0.5 ? -1.6 : 1.6) : (rng() - 0.5) * 2)
+    const car = new THREE.Group()
+    const body = new THREE.Mesh(carBody, rustMats[Math.floor(rng() * rustMats.length)])
+    const top = new THREE.Mesh(carTop, glassMat)
+    body.castShadow = top.castShadow = body.receiveShadow = true
+    car.add(body, top)
+    for (const [tx, tz] of [
+      [0.85, 1.3],
+      [-0.85, 1.3],
+      [0.85, -1.3],
+      [-0.85, -1.3],
+    ]) {
+      if (rng() < 0.35) continue // brak koła
+      const t = new THREE.Mesh(tireGeo, tireMat)
+      t.position.set(tx, 0.35, tz)
+      car.add(t)
+    }
+    const yaw = (horiz ? Math.PI / 2 : 0) + (rng() - 0.5) * 0.5
+    car.rotation.set((rng() - 0.5) * 0.06, yaw, (rng() - 0.5) * 0.12)
+    car.position.set(x, -0.05, z)
+    group.add(car)
+    const hw = horiz ? 2.1 : 1
+    const hd = horiz ? 1 : 2.1
+    boxes.push({ minX: x - hw, maxX: x + hw, minZ: z - hd, maxZ: z + hd })
+    cars++
+  }
+
+  // ── gruz przy ścianach ───────────────────────────────────
+  const rubbleGeo = T(new THREE.DodecahedronGeometry(0.35, 0))
+  const rubbleMat = T(new THREE.MeshStandardMaterial({ color: 0x8a8378, roughness: 1, flatShading: true }))
+  const RUB = 420
+  const rubble = new THREE.InstancedMesh(rubbleGeo, rubbleMat, RUB)
+  for (let r = 0; r < RUB; r++) {
+    const [i, j] = walk[Math.floor(rng() * walk.length)]
+    const side = Math.floor(rng() * 4)
+    const off = (rng() - 0.5) * CELL
+    const e = CELL / 2 - 0.3 - rng() * 0.8
+    const x = cx(i) + (side === 0 ? e : side === 1 ? -e : off)
+    const z = cz(j) + (side === 2 ? e : side === 3 ? -e : off)
+    const s = 0.4 + rng() * 1.3
+    m4.compose(new THREE.Vector3(x, s * 0.12, z), q.setFromEuler(new THREE.Euler(rng() * 6, rng() * 6, rng() * 6)), new THREE.Vector3(s, s * 0.6, s))
+    rubble.setMatrixAt(r, m4)
+    rubble.setColorAt(r, bushCol.setHSL(0.08, 0.08, 0.42 + rng() * 0.15))
+  }
+  rubble.castShadow = true
+  rubble.receiveShadow = true
+  group.add(rubble)
+
+  // ── beczki z ogniem (migoczące światło + dym) ────────────
+  const barrelGeo = T(new THREE.CylinderGeometry(0.4, 0.4, 1.1, 12))
+  barrelGeo.translate(0, 0.55, 0)
+  const barrelMat = T(new THREE.MeshStandardMaterial({ color: 0x5c3a24, roughness: 0.7, metalness: 0.5 }))
+  const flameGeo = T(new THREE.ConeGeometry(0.32, 0.9, 8, 1, true))
+  flameGeo.translate(0, 0.45, 0)
+  const flameMat = T(new THREE.MeshBasicMaterial({ color: 0xffa040, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }))
+  const flameMat2 = T(new THREE.MeshBasicMaterial({ color: 0xfff0a0, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }))
+  const fires: { light: THREE.PointLight; f1: THREE.Mesh; f2: THREE.Mesh; pos: THREE.Vector3; phase: number }[] = []
+  for (const [i, j] of plazaCells.filter(() => rng() < 0.35).slice(0, 7)) {
+    const x = cx(i) + (rng() - 0.5) * 3
+    const z = cz(j) + (rng() - 0.5) * 3
+    const b = new THREE.Mesh(barrelGeo, barrelMat)
+    b.position.set(x, 0, z)
+    b.castShadow = true
+    group.add(b)
+    const f1 = new THREE.Mesh(flameGeo, flameMat)
+    const f2 = new THREE.Mesh(flameGeo, flameMat2)
+    f1.position.set(x, 1.05, z)
+    f2.position.set(x, 1.05, z)
+    f2.scale.setScalar(0.55)
+    group.add(f1, f2)
+    const light = new THREE.PointLight(0xff8a3a, 8, 9, 1.6)
+    light.position.set(x, 1.8, z)
+    group.add(light)
+    fires.push({ light, f1, f2, pos: new THREE.Vector3(x, 1.5, z), phase: rng() * 10 })
+    boxes.push({ minX: x - 0.45, maxX: x + 0.45, minZ: z - 0.45, maxZ: z + 0.45 })
+  }
+  // dym: wspólna pula sprite'ów
+  const smokeTex = T(
+    canvasTex(
+      64,
+      64,
+      (g) => {
+        const grd = g.createRadialGradient(32, 32, 0, 32, 32, 32)
+        grd.addColorStop(0, 'rgba(120,115,110,0.55)')
+        grd.addColorStop(1, 'rgba(120,115,110,0)')
+        g.fillStyle = grd
+        g.fillRect(0, 0, 64, 64)
+      },
+      false,
+    ),
+  )
+  const smoke: { s: THREE.Sprite; mat: THREE.SpriteMaterial; t: number; life: number; v: THREE.Vector3 }[] = []
+  for (let k = 0; k < fires.length * 8; k++) {
+    const mat = T(new THREE.SpriteMaterial({ map: smokeTex, transparent: true, depthWrite: false, opacity: 0 }))
+    const s = new THREE.Sprite(mat)
+    group.add(s)
+    smoke.push({ s, mat, t: rng() * 3, life: 3, v: new THREE.Vector3() })
+  }
+
+  // ── zwisające kable między budynkami (kołyszą się, iskrzą) ─
+  const cableMat = T(new THREE.MeshStandardMaterial({ color: 0x1b1b1b, roughness: 0.8 }))
+  const cables: { mesh: THREE.Mesh; base: number; phase: number; spark: THREE.Vector3 | null }[] = []
+  for (const [i, j] of corridorCells) {
+    if (rng() > 0.22) continue
+    const alongX = wall(i, j - 1) && wall(i, j + 1) // ściany po bokach w osi Z → kabel w poprzek (wzdłuż Z)
+    const a = new THREE.Vector3(cx(i), 0, cz(j))
+    const b = a.clone()
+    const y = 4.5 + rng() * 3
+    if (alongX) {
+      a.z -= CELL / 2
+      b.z += CELL / 2
+    } else {
+      a.x -= CELL / 2
+      b.x += CELL / 2
+    }
+    a.y = y
+    b.y = y + (rng() - 0.5)
+    const broken = rng() < 0.35
+    const pts: THREE.Vector3[] = []
+    for (let k = 0; k <= 16; k++) {
+      const t = k / 16
+      const p = a.clone().lerp(b, broken ? t * 0.55 : t)
+      p.y -= broken ? t * t * 2.6 : Math.sin(t * Math.PI) * 1.1
+      pts.push(p)
+    }
+    const geo = T(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 24, 0.025, 4))
+    const mesh = new THREE.Mesh(geo, cableMat)
+    const pivot = new THREE.Group()
+    pivot.position.copy(a)
+    mesh.position.sub(a)
+    pivot.add(mesh)
+    group.add(pivot)
+    cables.push({ mesh: pivot as unknown as THREE.Mesh, base: 0, phase: rng() * 10, spark: broken ? pts[pts.length - 1].clone() : null })
+  }
+
+  // ── migoczący, zepsuty neon ──────────────────────────────
+  const neonMats: THREE.MeshBasicMaterial[] = []
+  const neonWords = ['RANDOM PLAY', 'HOTEL', 'NOODLES', 'OPEN 24', 'ARCADE']
+  let neons = 0
+  for (const [i, j] of walk) {
+    if (neons >= 5 || rng() > 0.08) continue
+    for (const [dx, dz] of [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1],
+    ]) {
+      if (!wall(i + dx, j + dz)) continue
+      const mat = T(new THREE.MeshBasicMaterial({ map: T(neonTex(neonWords[neons % neonWords.length])), transparent: true, side: THREE.DoubleSide }))
+      const sign = new THREE.Mesh(T(new THREE.PlaneGeometry(3, 0.75)), mat)
+      sign.position.set(cx(i) + dx * (CELL / 2 - 0.05), 3.4, cz(j) + dz * (CELL / 2 - 0.05))
+      sign.rotation.y = Math.atan2(-dx, -dz)
+      sign.rotation.z = (rng() - 0.5) * 0.25 // przekrzywiony
+      group.add(sign)
+      neonMats.push(mat)
+      neons++
+      break
+    }
+  }
+
+  // ── ptaki krążące nad miastem ────────────────────────────
+  const birdMat = T(new THREE.MeshBasicMaterial({ color: 0x1d1d22, side: THREE.DoubleSide }))
+  const wingGeo = T(new THREE.BufferGeometry())
+  wingGeo.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0.12, 0, 0, -0.12, 0.55, 0, 0], 3))
+  const flocks: { center: THREE.Vector3; r: number; speed: number; birds: { g: THREE.Group; l: THREE.Mesh; r: THREE.Mesh; off: THREE.Vector3; ph: number }[] }[] = []
+  for (let f = 0; f < 3; f++) {
+    const center = new THREE.Vector3((rng() - 0.5) * CITY_HALF, 24 + rng() * 10, (rng() - 0.5) * CITY_HALF)
+    const birds = []
+    for (let k = 0; k < 7 + Math.floor(rng() * 6); k++) {
+      const g = new THREE.Group()
+      const l = new THREE.Mesh(wingGeo, birdMat)
+      const r = new THREE.Mesh(wingGeo, birdMat)
+      r.scale.x = -1
+      g.add(l, r)
+      g.scale.setScalar(0.9 + rng() * 0.5)
+      group.add(g)
+      birds.push({ g, l, r, off: new THREE.Vector3((rng() - 0.5) * 6, (rng() - 0.5) * 2, (rng() - 0.5) * 6), ph: rng() * 6 })
+    }
+    flocks.push({ center, r: 14 + rng() * 14, speed: (0.12 + rng() * 0.1) * (rng() < 0.5 ? 1 : -1), birds })
+  }
+
+  // ── motyle ───────────────────────────────────────────────
+  const flyGeo = T(new THREE.PlaneGeometry(0.16, 0.12))
+  flyGeo.translate(0.08, 0, 0)
+  const butterflies: { g: THREE.Group; l: THREE.Mesh; r: THREE.Mesh; home: THREE.Vector3; ph: number }[] = []
+  const flyCols = [0xffd23f, 0xff8fd2, 0xffffff, 0x7fd6ff]
+  for (let k = 0; k < 22; k++) {
+    const [i, j] = walk[Math.floor(rng() * walk.length)]
+    const mat = T(new THREE.MeshBasicMaterial({ color: flyCols[k % flyCols.length], side: THREE.DoubleSide }))
+    const g = new THREE.Group()
+    const l = new THREE.Mesh(flyGeo, mat)
+    const r = new THREE.Mesh(flyGeo, mat)
+    r.scale.x = -1
+    g.add(l, r)
+    group.add(g)
+    butterflies.push({ g, l, r, home: new THREE.Vector3(cx(i), 0.8, cz(j)), ph: rng() * 20 })
+  }
+
+  // ── pyłki / kurz w słońcu (wokół gracza) ─────────────────
+  const MOTES = 260
+  const moteArr = new Float32Array(MOTES * 3)
+  for (let k = 0; k < MOTES; k++) moteArr.set([(rng() - 0.5) * 30, rng() * 6, (rng() - 0.5) * 30], k * 3)
+  const moteGeo = T(new THREE.BufferGeometry())
+  moteGeo.setAttribute('position', new THREE.BufferAttribute(moteArr, 3))
+  const motes = new THREE.Points(moteGeo, T(new THREE.PointsMaterial({ color: 0xfff6d0, size: 0.05, transparent: true, opacity: 0.7, depthWrite: false })))
+  group.add(motes)
+
+  // ── spadające liście (przy drzewach) ─────────────────────
+  const leafGeo = T(new THREE.PlaneGeometry(0.12, 0.08))
+  const leafM = T(new THREE.MeshStandardMaterial({ color: 0x9a8a30, side: THREE.DoubleSide }))
+  const leaves: { m: THREE.Mesh; t: number; tree: THREE.Vector3; seed: number }[] = []
+  if (treeSpots.length)
+    for (let k = 0; k < 60; k++) {
+      const m = new THREE.Mesh(leafGeo, leafM)
+      group.add(m)
+      leaves.push({ m, t: rng() * 6, tree: treeSpots[k % treeSpots.length], seed: rng() * 10 })
+    }
+
+  // ── podmuch kurzu przelatujący korytarzem ────────────────
+  const GUST = 140
+  const gustArr = new Float32Array(GUST * 3)
+  const gustGeo = T(new THREE.BufferGeometry())
+  gustGeo.setAttribute('position', new THREE.BufferAttribute(gustArr, 3))
+  const gustMat = T(new THREE.PointsMaterial({ color: 0xc9b79a, size: 0.09, transparent: true, opacity: 0, depthWrite: false }))
+  const gust = new THREE.Points(gustGeo, gustMat)
+  group.add(gust)
+  const gustState = { t: 4, dir: new THREE.Vector3(1, 0, 0), origin: new THREE.Vector3() }
+
+  // ── iskry z kabli ────────────────────────────────────────
+  const sparkGeo = T(new THREE.BufferGeometry())
+  const SPK = 40
+  const sparkArr = new Float32Array(SPK * 3)
+  const sparkVel = Array.from({ length: SPK }, () => new THREE.Vector3())
+  sparkGeo.setAttribute('position', new THREE.BufferAttribute(sparkArr, 3))
+  const sparkMat = T(new THREE.PointsMaterial({ color: 0xbfe6ff, size: 0.08, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }))
+  const sparks = new THREE.Points(sparkGeo, sparkMat)
+  group.add(sparks)
+  const sparkLight = new THREE.PointLight(0x9fd8ff, 0, 6)
+  group.add(sparkLight)
+  const sparkState = { t: 2, life: 0 }
+
+  // ── flow field (BFS) ─────────────────────────────────────
+  const dist = new Int32Array(GW * GH).fill(-1)
+  let fieldCell = -1
+  const rebuildField = (pi: number, pj: number) => {
+    const id = pj * GW + pi
+    if (id === fieldCell) return
+    fieldCell = id
+    dist.fill(-1)
+    if (wall(pi, pj)) return
+    const queue = [id]
+    dist[id] = 0
+    for (let h = 0; h < queue.length; h++) {
+      const c = queue[h]
+      const i = c % GW
+      const j = (c / GW) | 0
+      for (const [dx, dz] of [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ]) {
+        const ni = i + dx
+        const nj = j + dz
+        if (wall(ni, nj)) continue
+        const n = nj * GW + ni
+        if (dist[n] >= 0) continue
+        dist[n] = dist[c] + 1
+        queue.push(n)
+      }
+    }
+  }
+  const target = new THREE.Vector3()
+  const wallAt = (x: number, z: number) => wall(ci(x), cj(z))
+  const losClear = (a: THREE.Vector3, b: THREE.Vector3, margin: number) => {
+    const d = a.distanceTo(b)
+    const n = Math.ceil(d / 0.5)
+    for (let k = 1; k < n; k++) {
+      const t = k / n
+      const x = a.x + (b.x - a.x) * t
+      const z = a.z + (b.z - a.z) * t
+      if (wallAt(x + margin, z) || wallAt(x - margin, z) || wallAt(x, z + margin) || wallAt(x, z - margin)) return false
+    }
+    return true
+  }
+
+  // ── API ──────────────────────────────────────────────────
+  return {
+    boxes,
+    start,
+    wallAt,
+    spawnPoint(from, min, max) {
+      const pi = ci(from.x)
+      const pj = cj(from.z)
+      rebuildField(pi, pj)
+      // komórki osiągalne w [min,max] kroków ścieżki, losowo
+      const cand = walk.filter(([i, j]) => {
+        const d = dist[j * GW + i] * CELL
+        return d >= min && d <= max
+      })
+      const pool = cand.length ? cand : walk
+      const [i, j] = pool[Math.floor(Math.random() * pool.length)]
+      return new THREE.Vector3(cx(i) + (Math.random() - 0.5) * (CELL - 2), 0, cz(j) + (Math.random() - 0.5) * (CELL - 2))
     },
-    drawMinimap(ctx, size, player, facing, enemies) {
-      const R = 26 // promień widoku w metrach
+    steer(from, out) {
+      // cel = gracz; w zasięgu wzroku → prosto, inaczej po flow field
+      if (losClear(from, target, 0.45)) return out.copy(target).sub(from).setY(0).normalize()
+      const i = ci(from.x)
+      const j = cj(from.z)
+      let best = dist[j * GW + i]
+      let bi = i
+      let bj = j
+      for (const [dx, dz] of [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ]) {
+        const d = wall(i + dx, j + dz) ? -1 : dist[(j + dz) * GW + i + dx]
+        if (d >= 0 && (best < 0 || d < best)) {
+          best = d
+          bi = i + dx
+          bj = j + dz
+        }
+      }
+      out.set(cx(bi) - from.x, 0, cz(bj) - from.z)
+      if (out.lengthSq() < 0.01) out.copy(target).sub(from).setY(0)
+      return out.normalize()
+    },
+    cameraDistance(t, dir, max) {
+      const steps = Math.ceil(max / 0.15)
+      for (let k = 1; k <= steps; k++) {
+        const d = (k / steps) * max
+        const x = t.x + dir.x * d
+        const z = t.z + dir.z * d
+        const y = t.y + dir.y * d
+        if (y < 0.3) return Math.max(0.6, d - 0.3)
+        if (wallAt(x + 0.3, z) || wallAt(x - 0.3, z) || wallAt(x, z + 0.3) || wallAt(x, z - 0.3)) return Math.max(0.6, d - 0.25)
+      }
+      return max
+    },
+    update(time, dt, player, camera) {
+      uTime.value = time
+      target.copy(player)
+      rebuildField(ci(player.x), cj(player.z))
+      sky.position.set(camera.x, 0, camera.z)
+
+      // ogień
+      for (const f of fires) {
+        const fl = 0.75 + Math.sin(time * 17 + f.phase) * 0.12 + Math.sin(time * 31 + f.phase * 2) * 0.1 + Math.random() * 0.06
+        f.light.intensity = 7 * fl + 2
+        f.f1.scale.set(1, fl * 1.3, 1)
+        f.f2.scale.set(0.55, fl * 0.9, 0.55)
+        f.f1.rotation.y = time * 3
+      }
+      flameMat.opacity = 0.7 + Math.random() * 0.2
+      for (let k = 0; k < smoke.length; k++) {
+        const p = smoke[k]
+        const f = fires[k % fires.length]
+        p.t += dt
+        if (p.t >= p.life) {
+          p.t = 0
+          p.s.position.copy(f.pos).add(new THREE.Vector3((Math.random() - 0.5) * 0.2, 0, (Math.random() - 0.5) * 0.2))
+          p.v.set(0.25 + (Math.random() - 0.5) * 0.2, 0.9 + Math.random() * 0.4, (Math.random() - 0.5) * 0.2)
+        }
+        const k01 = p.t / p.life
+        p.s.position.addScaledVector(p.v, dt)
+        p.s.scale.setScalar(0.5 + k01 * 2.6)
+        p.mat.opacity = Math.sin(k01 * Math.PI) * 0.5
+      }
+
+      // kable kołyszą się na wietrze
+      for (const c of cables) c.mesh.rotation.x = Math.sin(time * 1.3 + c.phase) * 0.05
+      // iskry co kilka sekund z losowego zerwanego kabla
+      sparkState.t -= dt
+      const broken = cables.filter((c) => c.spark)
+      if (sparkState.t <= 0 && broken.length) {
+        sparkState.t = 1.5 + Math.random() * 3
+        sparkState.life = 0.6
+        const src = broken[Math.floor(Math.random() * broken.length)].spark!
+        for (let k = 0; k < SPK; k++) {
+          sparkArr.set([src.x, src.y, src.z], k * 3)
+          sparkVel[k].set((Math.random() - 0.5) * 4, Math.random() * 2, (Math.random() - 0.5) * 4)
+        }
+        sparkLight.position.copy(src)
+      }
+      if (sparkState.life > 0) {
+        sparkState.life -= dt
+        const at = sparkGeo.getAttribute('position') as THREE.BufferAttribute
+        for (let k = 0; k < SPK; k++) {
+          sparkVel[k].y -= 12 * dt
+          at.setXYZ(k, at.getX(k) + sparkVel[k].x * dt, Math.max(0.05, at.getY(k) + sparkVel[k].y * dt), at.getZ(k) + sparkVel[k].z * dt)
+        }
+        at.needsUpdate = true
+        sparkMat.opacity = Math.max(0, sparkState.life / 0.6)
+        sparkLight.intensity = Math.random() < 0.5 ? 14 * sparkMat.opacity : 0
+      } else {
+        sparkMat.opacity = 0
+        sparkLight.intensity = 0
+      }
+
+      // migający neon
+      for (const [k, m] of neonMats.entries()) {
+        const s = Math.sin(time * 7 + k * 3) + Math.sin(time * 23 + k)
+        m.opacity = s > 1.3 ? 0.15 : 0.95
+      }
+
+      // ptaki
+      for (const f of flocks) {
+        const a = time * f.speed
+        for (const b of f.birds) {
+          const ang = a + b.off.x * 0.03
+          const x = f.center.x + Math.cos(ang) * (f.r + b.off.z)
+          const z = f.center.z + Math.sin(ang) * (f.r + b.off.z)
+          b.g.position.set(x, f.center.y + b.off.y + Math.sin(time + b.ph) * 0.6, z)
+          b.g.rotation.y = -ang + (f.speed > 0 ? 0 : Math.PI)
+          const flap = Math.sin(time * 9 + b.ph) * 0.7
+          b.l.rotation.z = flap
+          b.r.rotation.z = -flap
+        }
+      }
+
+      // motyle krążą wokół swoich miejsc
+      for (const b of butterflies) {
+        const t = time * 0.6 + b.ph
+        b.g.position.set(b.home.x + Math.sin(t) * 1.5 + Math.sin(t * 2.3) * 0.4, 0.6 + Math.abs(Math.sin(t * 1.7)) * 0.9, b.home.z + Math.cos(t * 0.8) * 1.5)
+        b.g.rotation.y = t * 1.3
+        const flap = Math.sin(time * 22 + b.ph) * 1.1
+        b.l.rotation.y = flap
+        b.r.rotation.y = -flap
+      }
+
+      // pyłki dryfują wokół gracza
+      motes.position.set(player.x, 0, player.z)
+      const ma = moteGeo.getAttribute('position') as THREE.BufferAttribute
+      for (let k = 0; k < MOTES; k++) {
+        let y = ma.getY(k) + Math.sin(time + k) * dt * 0.15 + dt * 0.05
+        if (y > 6) y = 0
+        ma.setXYZ(k, ma.getX(k) + Math.sin(time * 0.3 + k) * dt * 0.2, y, ma.getZ(k) + Math.cos(time * 0.2 + k) * dt * 0.2)
+      }
+      ma.needsUpdate = true
+
+      // liście spadają z drzew
+      for (const l of leaves) {
+        l.t += dt
+        const life = 6
+        if (l.t > life) l.t = 0
+        const k = l.t / life
+        l.m.position.set(l.tree.x + Math.sin(l.t * 1.5 + l.seed) * 1.2 + k * 2, 5.5 - k * 5.4, l.tree.z + Math.cos(l.t * 1.2 + l.seed) * 1.2)
+        l.m.rotation.set(l.t * 3 + l.seed, l.t * 2, l.t * 4)
+      }
+
+      // podmuch kurzu
+      gustState.t -= dt
+      if (gustState.t <= 0) {
+        gustState.t = 7 + Math.random() * 6
+        const a = Math.random() * Math.PI * 2
+        gustState.dir.set(Math.cos(a), 0, Math.sin(a))
+        gustState.origin.copy(player).addScaledVector(gustState.dir, -10)
+        for (let k = 0; k < GUST; k++) gustArr.set([gustState.origin.x + (Math.random() - 0.5) * 4, Math.random() * 1.5, gustState.origin.z + (Math.random() - 0.5) * 4], k * 3)
+      }
+      const gl = 7 + 6 - gustState.t // czas od startu podmuchu (przybliżony)
+      const active = gustState.t > 3
+      gustMat.opacity = active ? Math.min(0.5, (gustState.t - 3) * 0.3) : 0
+      if (active) {
+        const ga = gustGeo.getAttribute('position') as THREE.BufferAttribute
+        for (let k = 0; k < GUST; k++)
+          ga.setXYZ(k, ga.getX(k) + gustState.dir.x * dt * (6 + (k % 5)), ga.getY(k) + Math.sin(gl * 3 + k) * dt * 0.6, ga.getZ(k) + gustState.dir.z * dt * (6 + (k % 5)))
+        ga.needsUpdate = true
+      }
+    },
+    drawMinimap(ctx, size, player, facing, enemies, camYaw = 0) {
+      const R = 30
       const s = size / (R * 2)
       ctx.clearRect(0, 0, size, size)
       ctx.save()
       ctx.beginPath()
       ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2)
       ctx.clip()
-      ctx.fillStyle = 'rgba(12,10,20,0.85)'
+      ctx.fillStyle = 'rgba(30,36,24,0.85)'
       ctx.fillRect(0, 0, size, size)
+      // obracamy mapę razem z kamerą (góra = kierunek patrzenia)
+      ctx.translate(size / 2, size / 2)
+      ctx.rotate(camYaw - Math.PI)
+      ctx.translate(-size / 2, -size / 2)
       const tx = (x: number) => (x - player.x) * s + size / 2
       const tz = (z: number) => (z - player.z) * s + size / 2
-      // ulice
-      ctx.fillStyle = 'rgba(255,255,255,0.08)'
-      for (let c = -BLOCK * 3; c <= BLOCK * 3; c += BLOCK) {
-        ctx.fillRect(tx(c - ROAD), 0, ROAD * 2 * s, size)
-        ctx.fillRect(0, tz(c - ROAD), size, ROAD * 2 * s)
-      }
-      // budynki
-      ctx.fillStyle = 'rgba(160,150,200,0.45)'
-      for (const b of boxes) ctx.fillRect(tx(b.minX), tz(b.minZ), (b.maxX - b.minX) * s, (b.maxZ - b.minZ) * s)
-      // granica
-      ctx.strokeStyle = '#' + accent.getHexString()
-      ctx.lineWidth = 2
-      ctx.strokeRect(tx(-CITY_HALF), tz(-CITY_HALF), CITY_HALF * 2 * s, CITY_HALF * 2 * s)
-      // wrogowie
+      for (let j = 0; j < GH; j++)
+        for (let i = 0; i < GW; i++) {
+          const c = MAP[j][i]
+          ctx.fillStyle = c === '#' ? 'rgba(150,140,120,0.75)' : c === 'P' ? 'rgba(110,150,70,0.5)' : 'rgba(255,255,255,0.08)'
+          ctx.fillRect(tx(cx(i) - CELL / 2), tz(cz(j) - CELL / 2), CELL * s + 0.5, CELL * s + 0.5)
+        }
       ctx.fillStyle = '#ff3e5a'
       for (const e of enemies) {
-        let ex = tx(e.x)
-        let ez = tz(e.z)
-        const dx = ex - size / 2
-        const dz = ez - size / 2
-        const dl = Math.hypot(dx, dz)
-        const maxR = size / 2 - 5
-        if (dl > maxR) {
-          ex = size / 2 + (dx / dl) * maxR
-          ez = size / 2 + (dz / dl) * maxR
-        }
         ctx.beginPath()
-        ctx.arc(ex, ez, 3, 0, Math.PI * 2)
+        ctx.arc(tx(e.x), tz(e.z), 3, 0, Math.PI * 2)
         ctx.fill()
       }
-      // gracz
       ctx.translate(size / 2, size / 2)
       ctx.rotate(-facing + Math.PI)
-      ctx.fillStyle = '#fff'
+      ctx.fillStyle = '#' + accent.getHexString()
       ctx.beginPath()
       ctx.moveTo(0, -7)
       ctx.lineTo(5, 5)
@@ -609,23 +1074,48 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color): City {
   }
 }
 
+/** Skleja kilka geometrii (z tymi samymi atrybutami) w jedną. */
+function mergeGeos(geos: THREE.BufferGeometry[]) {
+  const out = new THREE.BufferGeometry()
+  for (const name of ['position', 'normal', 'uv']) {
+    const parts = geos.map((g) => g.getAttribute(name) as THREE.BufferAttribute)
+    const total = parts.reduce((s, p) => s + p.array.length, 0)
+    const arr = new Float32Array(total)
+    let o = 0
+    for (const p of parts) {
+      arr.set(p.array as Float32Array, o)
+      o += p.array.length
+    }
+    out.setAttribute(name, new THREE.BufferAttribute(arr, parts[0].itemSize))
+  }
+  const idx: number[] = []
+  let base = 0
+  for (const g of geos) {
+    const ix = g.getIndex()
+    if (ix) for (let k = 0; k < ix.count; k++) idx.push(ix.getX(k) + base)
+    base += g.getAttribute('position').count
+  }
+  out.setIndex(idx)
+  return out
+}
+
 /** Wypycha okrąg (p, r) z prostokątów; zwraca true, jeśli była kolizja. */
 export function pushOutOfBoxes(p: THREE.Vector3, r: number, boxes: Box[]) {
   let hit = false
   for (const b of boxes) {
-    const cx = THREE.MathUtils.clamp(p.x, b.minX, b.maxX)
-    const cz = THREE.MathUtils.clamp(p.z, b.minZ, b.maxZ)
-    const dx = p.x - cx
-    const dz = p.z - cz
+    if (p.x < b.minX - r || p.x > b.maxX + r || p.z < b.minZ - r || p.z > b.maxZ + r) continue
+    const qx = THREE.MathUtils.clamp(p.x, b.minX, b.maxX)
+    const qz = THREE.MathUtils.clamp(p.z, b.minZ, b.maxZ)
+    const dx = p.x - qx
+    const dz = p.z - qz
     const d2 = dx * dx + dz * dz
     if (d2 >= r * r) continue
     hit = true
     if (d2 > 1e-8) {
       const d = Math.sqrt(d2)
-      p.x = cx + (dx / d) * r
-      p.z = cz + (dz / d) * r
+      p.x = qx + (dx / d) * r
+      p.z = qz + (dz / d) * r
     } else {
-      // środek w środku prostokąta — wypchnij najkrótszą drogą
       const l = p.x - b.minX
       const rr = b.maxX - p.x
       const t = p.z - b.minZ

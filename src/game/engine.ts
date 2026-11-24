@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import { buildCity, CITY_HALF, pushOutOfBoxes, type City } from './city'
+
 import { ELEMENT_COLORS, type Item } from '../data/roster'
 import {
   createPlaceholderAvatar,
@@ -9,6 +10,7 @@ import {
   type Avatar,
 } from './avatar'
 import { PROJECTILE, rangedWeaponFor, type ProjectileKind, type RangedWeapon } from './weapons'
+import { flavorFor, STYLE, styleFor, type Flavor, type StyleSpec, type WeaponStyle } from './styles'
 import { createEnemyRig, disposeEnemyGeometries, type EnemyKind, type EnemyRig } from './enemies'
 
 // ───────────────────────── tuning ─────────────────────────
@@ -16,13 +18,8 @@ import { createEnemyRig, disposeEnemyGeometries, type EnemyKind, type EnemyRig }
 const PLAYER_R = 0.45
 const MOVE_SPEED = 7
 const LIGHT_DUR = [0.3, 0.3, 0.42]
-const LIGHT_DMG = [10, 12, 22]
 const LIGHT_RANGE = 2.3
 const COMBO_WINDOW = 0.45
-const HEAVY_DUR = 0.55
-const HEAVY_CD = 6
-const HEAVY_RADIUS = 5
-const HEAVY_DMG = 45
 const DODGE_DUR = 0.22
 const DODGE_SPEED = 19
 const DODGE_IFRAMES = 0.35
@@ -51,6 +48,8 @@ export interface HudState {
   credit?: string
   gameOver: boolean
   banner: string | null
+  /** nazwa superumiejętności (zależy od broni) */
+  superName: string
 }
 
 export type GameAction = 'attack' | 'special' | 'dodge'
@@ -96,6 +95,8 @@ interface Burst {
   mesh: THREE.Mesh
   t: number
   max: number
+  /** nie skaluj (smugi, krzyże) — tylko zanikanie */
+  fixed?: boolean
   scale: number
 }
 
@@ -150,6 +151,15 @@ export class GameEngine {
   /** broń dystansowa agenta (null = walka wręcz) */
   private ranged: RangedWeapon | null = null
   private projectiles: Projectile[] = []
+  private style: WeaponStyle = 'blade'
+  private spec: StyleSpec = STYLE.blade
+  private flavor: Flavor = { tempo: 1, mirror: 1, flair: 0.5, stance: 0.5 }
+  private agentName = ''
+  private superFired = new Set<number>()
+  private superPrevK = 0
+  private dashFrom = new THREE.Vector3()
+  private later: { t: number; fn: () => void }[] = []
+  private falling: { mesh: THREE.Mesh; y: number; speed: number }[] = []
   private shotSide = 1
   private specialCd = 0
   private dodgeCd = 0
@@ -209,6 +219,10 @@ export class GameEngine {
     this.onReward = opts.onReward
     const agent = opts.agent
     this.ranged = rangedWeaponFor(agent.name)
+    this.style = styleFor(agent.name, this.ranged)
+    this.spec = STYLE[this.style]
+    this.flavor = flavorFor(agent.name)
+    this.agentName = agent.name
     const [c1, c2] = agent.element ? ELEMENT_COLORS[agent.element] : ['#7cffd4', '#ffffff']
     this.colorA = new THREE.Color(c1)
     this.colorB = new THREE.Color(c2)
@@ -238,7 +252,7 @@ export class GameEngine {
     this.overlay.className = 'game-floaters'
     container.appendChild(this.overlay)
 
-    this.camera = new THREE.PerspectiveCamera(55, w / h, 0.1, 200)
+    this.camera = new THREE.PerspectiveCamera(60, w / h, 0.1, 400)
     this.camera.position.set(0, 7.2, 8.6)
 
     this.buildArena()
@@ -256,32 +270,32 @@ export class GameEngine {
 
   private buildArena() {
     const s = this.scene
-    s.background = new THREE.Color(0x07060d)
-    s.fog = new THREE.Fog(0x0a0814, 26, 80)
+    s.background = new THREE.Color(0xbfc8c0)
+    s.fog = new THREE.Fog(0xc4ccc2, 30, 110)
 
-    s.add(new THREE.HemisphereLight(0x8fa8ff, 0x1a0f2a, 1.1))
-    const amb = new THREE.AmbientLight(0xffffff, 0.35)
+    s.add(new THREE.HemisphereLight(0xdcecff, 0x6f7a4a, 1.9))
+    const amb = new THREE.AmbientLight(0xfff6e8, 0.5)
     s.add(amb)
-    const sun = new THREE.DirectionalLight(0xffffff, 1.6)
-    sun.position.set(8, 16, 6)
+    const sun = new THREE.DirectionalLight(0xfff0d6, 2.6)
     sun.castShadow = true
-    sun.shadow.mapSize.set(1024, 1024)
+    sun.shadow.mapSize.set(2048, 2048)
+    sun.shadow.bias = -0.0005
     const sc = sun.shadow.camera
-    sc.left = -14
-    sc.right = 14
-    sc.top = 14
-    sc.bottom = -14
+    sc.left = -22
+    sc.right = 22
+    sc.top = 22
+    sc.bottom = -22
     sc.near = 1
-    sc.far = 50
+    sc.far = 90
     s.add(sun, sun.target)
     this.sun = sun
-    const rim = new THREE.PointLight(this.colorA, 30, 14)
+    const rim = new THREE.PointLight(this.colorA, 6, 6)
     rim.position.set(0, 3, 0)
     this.player.add(rim)
 
     // miasto: ulice, budynki, plac, latarnie, auta
     this.city = buildCity(s, this.colorA)
-    this.ppos.set(4, 0, 5)
+    this.ppos.copy(this.city.start)
 
     // minimapa
     this.minimap = document.createElement('canvas')
@@ -299,12 +313,15 @@ export class GameEngine {
     }
     const dustGeo = new THREE.BufferGeometry()
     dustGeo.setAttribute('position', new THREE.BufferAttribute(pts, 3))
-    const dustMat = new THREE.PointsMaterial({ color: 0x7cffd4, size: 0.06, transparent: true, opacity: 0.5 })
+    const dustMat = new THREE.PointsMaterial({ color: 0xfff3c4, size: 0.05, transparent: true, opacity: 0.45 })
     this.dust = new THREE.Points(dustGeo, dustMat)
     s.add(this.dust)
 
     this.disposables.push(dustGeo, dustMat)
   }
+  private camYaw = -Math.PI * 0.75
+  private camPitch = 0.42
+  private camDist = 4.6
   private sun!: THREE.DirectionalLight
   private dust!: THREE.Points
   private spinners: THREE.Object3D[] = []
@@ -317,7 +334,7 @@ export class GameEngine {
     try {
       const manifest = await loadManifest()
       const entry = manifest[agent.name]
-      if (typeof entry?.url === 'string' && entry.url && !this.disposed) av = await loadModelAvatar(entry, cancel, '#' + this.colorA.getHexString())
+      if (typeof entry?.url === 'string' && entry.url && !this.disposed) av = await loadModelAvatar(entry, cancel, '#' + this.colorA.getHexString(), { name: this.agentName, style: this.style })
     } catch (e) {
       if (!cancel.cancelled) console.warn('[game] model load failed, using placeholder', e)
     }
@@ -352,10 +369,46 @@ export class GameEngine {
     on(window, 'blur', () => this.keys.clear())
     const cv = this.renderer.domElement
     on(cv, 'mousedown', (e) => {
+      if (document.pointerLockElement !== cv && e.button === 0 && !this.gameOver) {
+        cv.requestPointerLock?.()
+        return
+      }
       if (e.button === 0) this.trigger('attack')
       else if (e.button === 2) this.trigger('special')
     })
     on(cv, 'contextmenu', (e) => e.preventDefault())
+    // TPP: rozglądanie myszą (pointer lock) i przeciąganiem palca
+    on(window, 'mousemove', (e) => {
+      if (document.pointerLockElement !== cv) return
+      this.camYaw -= e.movementX * 0.0032
+      this.camPitch = THREE.MathUtils.clamp(this.camPitch + e.movementY * 0.0026, -0.15, 1.1)
+    })
+    let touchId: number | null = null
+    let tx = 0
+    let ty = 0
+    on(cv, 'touchstart', (e) => {
+      const t = e.changedTouches[0]
+      if (touchId === null && t.clientX > window.innerWidth * 0.35) {
+        touchId = t.identifier
+        tx = t.clientX
+        ty = t.clientY
+      }
+    })
+    on(cv, 'touchmove', (e) => {
+      for (const t of Array.from(e.changedTouches))
+        if (t.identifier === touchId) {
+          this.camYaw -= (t.clientX - tx) * 0.006
+          this.camPitch = THREE.MathUtils.clamp(this.camPitch + (t.clientY - ty) * 0.004, -0.15, 1.1)
+          tx = t.clientX
+          ty = t.clientY
+        }
+    })
+    on(cv, 'touchend', (e) => {
+      for (const t of Array.from(e.changedTouches)) if (t.identifier === touchId) touchId = null
+    })
+    this.cleanups.push(() => {
+      if (document.pointerLockElement === cv) document.exitPointerLock()
+    })
     on(window, 'resize', () => this.resize())
     const ro = new ResizeObserver(() => this.resize())
     ro.observe(this.container)
@@ -427,11 +480,12 @@ export class GameEngine {
   private startLight() {
     const inp = this.moveInput(new THREE.Vector3())
     if (inp.lengthSq() > 0.01) this.facing = Math.atan2(inp.x, inp.z)
+    else this.facing = this.camYaw + Math.PI
     this.faceNearest(this.ranged ? PROJECTILE[this.ranged.kind].range : 4)
     if (this.comboTimer <= 0) this.combo = 0
     this.action = 'light'
     this.actionT = 0
-    this.actionDur = LIGHT_DUR[this.combo]
+    this.actionDur = this.ranged ? LIGHT_DUR[this.combo] : this.spec.dur[this.combo] / this.flavor.tempo
     this.swingHit = false
     this.queuedAttack = false
   }
@@ -439,11 +493,17 @@ export class GameEngine {
   private startHeavy() {
     this.action = 'heavy'
     this.actionT = 0
-    this.actionDur = HEAVY_DUR
-    this.specialCd = HEAVY_CD
+    this.actionDur = this.spec.superDur
+    this.specialCd = this.spec.superCd
     this.swingHit = false
     this.queuedAttack = false
-    this.iframes = Math.max(this.iframes, HEAVY_DUR)
+    this.iframes = Math.max(this.iframes, this.spec.superDur)
+    this.superFired.clear()
+    this.superPrevK = 0
+    // super celuje w najbliższego wroga (albo tam, gdzie patrzy kamera)
+    this.facing = this.camYaw + Math.PI
+    this.faceNearest(this.ranged ? 14 : 8)
+    this.floatText(this.ppos.clone().setY(2.6), this.spec.superName, 'super')
   }
 
   private startDodge() {
@@ -474,7 +534,8 @@ export class GameEngine {
       const fx = Math.sin(this.facing)
       const fz = Math.cos(this.facing)
       const isFinisher = this.combo === 2
-      const range = LIGHT_RANGE + (isFinisher ? 0.5 : 0)
+      const sp = this.spec
+      const range = sp.range + (isFinisher ? 0.5 : 0)
       let any = false
       for (const e of this.enemies) {
         if (e.dead || e.state === 'spawn') continue
@@ -483,35 +544,336 @@ export class GameEngine {
         const d = Math.hypot(dx, dz)
         if (d > range + e.r) continue
         const dot = d > 0.01 ? (dx * fx + dz * fz) / d : 1
-        if (dot < (isFinisher ? 0.1 : 0.35)) continue
-        const dmg = Math.round(LIGHT_DMG[this.combo] * this.dmgMul * (0.9 + Math.random() * 0.2))
-        this.damageEnemy(e, dmg, isFinisher ? 9 : 5, isFinisher)
+        if (dot < sp.arc[this.combo]) continue
+        const dmg = Math.round(sp.dmg[this.combo] * this.dmgMul * (0.9 + Math.random() * 0.2))
+        const knock = this.style === 'heavy' ? (isFinisher ? 14 : 8) : this.style === 'fist' ? (isFinisher ? 11 : 3) : isFinisher ? 9 : 5
+        this.damageEnemy(e, dmg, knock, isFinisher)
         any = true
       }
       // swing slash vfx
-      this.spawnSlash(isFinisher)
+      this.spawnStyleSlash(isFinisher)
       if (any) {
-        this.hitStop = isFinisher ? 0.09 : 0.05
-        this.shake = Math.max(this.shake, isFinisher ? 0.35 : 0.15)
+        const heavy = this.style === 'heavy'
+        this.hitStop = isFinisher ? (heavy ? 0.13 : 0.09) : heavy ? 0.07 : 0.05
+        this.shake = Math.max(this.shake, isFinisher ? (heavy ? 0.5 : 0.35) : heavy ? 0.25 : 0.15)
       }
     } else if (this.action === 'heavy') {
       const k = this.actionT / this.actionDur
-      if (k < 0.5) return
-      this.swingHit = true
-      this.spawnBurst(this.ppos, HEAVY_RADIUS)
-      for (let i = 0; i < 40; i++) this.spawnParticle(this.ppos.clone().setY(0.5), i % 2 ? this.colorA : this.colorB, 10, 0.7)
-      let any = false
-      for (const e of this.enemies) {
-        if (e.dead || e.state === 'spawn') continue
-        const d = e.pos.distanceTo(this.ppos)
-        if (d > HEAVY_RADIUS + e.r) continue
-        const dmg = Math.round(HEAVY_DMG * this.dmgMul * (0.9 + Math.random() * 0.2))
-        this.damageEnemy(e, dmg, 14, true)
-        any = true
-      }
-      this.shake = 0.6
-      if (any) this.hitStop = 0.12
+      this.superTick(this.superPrevK, k)
+      this.superPrevK = k
     }
+  }
+
+  // ───────────── superumiejętności (zależne od broni) ─────────────
+
+  private fwd() {
+    return new THREE.Vector3(Math.sin(this.facing), 0, Math.cos(this.facing))
+  }
+
+  /** Obrażenia dla wrogów spełniających warunek; zwraca liczbę trafionych. */
+  private hitWhere(pred: (e: Enemy, d: THREE.Vector3) => boolean, dmg: number, knock: number, crit = true) {
+    let n = 0
+    for (const e of this.enemies) {
+      if (e.dead || e.state === 'spawn') continue
+      const d = e.pos.clone().sub(this.ppos).setY(0)
+      if (!pred(e, d)) continue
+      this.damageEnemy(e, Math.round(dmg * this.dmgMul * (0.9 + Math.random() * 0.2)), knock, crit)
+      n++
+    }
+    return n
+  }
+
+  private inRadius(r: number) {
+    return (e: Enemy, d: THREE.Vector3) => d.length() <= r + e.r
+  }
+
+  private inCone(r: number, minDot: number) {
+    const f = this.fwd()
+    return (e: Enemy, d: THREE.Vector3) => {
+      const l = d.length()
+      return l <= r + e.r && (l < 0.01 || d.dot(f) / l >= minDot)
+    }
+  }
+
+  /** Najbliższy wróg (cel superów dystansowych) albo punkt przed postacią. */
+  private superTarget(dist: number) {
+    let best: Enemy | null = null
+    let bd = 18
+    for (const e of this.enemies) {
+      if (e.dead || e.state === 'spawn') continue
+      const d = e.pos.distanceTo(this.ppos)
+      if (d < bd) {
+        bd = d
+        best = e
+      }
+    }
+    return best ? best.pos.clone() : this.ppos.clone().addScaledVector(this.fwd(), dist)
+  }
+
+  /** Odpala zdarzenia super-ataku, które wypadają w przedziale (k0, k1]. */
+  private superTick(k0: number, k1: number) {
+    const at = (t: number, id: number, fn: () => void) => {
+      if (k0 < t && k1 >= t && !this.superFired.has(id)) {
+        this.superFired.add(id)
+        fn()
+      }
+    }
+    const every = (from: number, to: number, step: number, base: number, fn: (i: number) => void) => {
+      for (let i = 0, t = from; t <= to; i++, t += step) at(t, base + i, () => fn(i))
+    }
+    const A = this.colorA
+    const B = this.colorB
+    const up = (p: THREE.Vector3, y = 0.6) => p.clone().setY(y)
+
+    switch (this.style) {
+      case 'blade': {
+        at(0.3, 1, () => {
+          this.dashFrom.copy(this.ppos)
+          for (let i = 0; i < 10; i++) this.spawnParticle(up(this.ppos), B, 4, 0.3)
+        })
+        at(0.45, 2, () => {
+          // cięcie wzdłuż przebytej drogi
+          const a = this.dashFrom
+          const b = this.ppos.clone()
+          const ab = b.clone().sub(a)
+          const L = Math.max(0.01, ab.length())
+          const hit: Enemy[] = []
+          this.hitWhere((e) => {
+            const t = THREE.MathUtils.clamp(e.pos.clone().sub(a).dot(ab) / (L * L), 0, 1)
+            const ok = e.pos.distanceTo(a.clone().addScaledVector(ab, t)) <= 1.8 + e.r
+            if (ok) hit.push(e)
+            return ok
+          }, 60, 4)
+          this.spawnLine(a, b, 0.5, B, 0.5)
+          this.spawnLine(a, b, 0.12, new THREE.Color(0xffffff), 0.6)
+          this.hitStop = 0.14
+          this.shake = 0.45
+          // opóźnione „rozcięcie” trafionych — klasyczne iai
+          this.later.push({
+            t: 0.35,
+            fn: () => {
+              for (const e of hit) {
+                if (e.dead) continue
+                this.spawnCross(e.pos, B)
+                this.damageEnemy(e, Math.round(30 * this.dmgMul), 7, true)
+              }
+              if (hit.length) this.shake = Math.max(this.shake, 0.4)
+            },
+          })
+        })
+        break
+      }
+      case 'dual': {
+        every(0.08, 0.86, 0.075, 10, (i) => {
+          this.hitWhere(this.inRadius(3.2), 8, 1.5, false)
+          const a = this.facing + i * 1.1
+          this.spawnArcAt(a, 3.2, i % 2 ? A : B, 0.7 + (i % 3) * 0.3)
+        })
+        at(0.92, 2, () => {
+          this.spawnBurst(this.ppos, 4.2)
+          this.hitWhere(this.inRadius(4.2), 28, 11)
+          this.hitStop = 0.1
+          this.shake = 0.45
+        })
+        break
+      }
+      case 'heavy': {
+        at(0.3, 1, () => {
+          for (let i = 0; i < 12; i++) this.spawnParticle(up(this.ppos, 0.2), B, 3, 0.4)
+        })
+        at(0.62, 2, () => {
+          this.spawnBurst(this.ppos, 6)
+          this.spawnBurst(this.ppos, 3.2, B.clone())
+          for (let i = 0; i < 36; i++) this.spawnParticle(up(this.ppos, 0.3).add(new THREE.Vector3((Math.random() - 0.5) * 4, 0, (Math.random() - 0.5) * 4)), i % 2 ? A : new THREE.Color(0x8a8378), 9, 0.8, true)
+          this.hitWhere(this.inRadius(6), 75, 16)
+          this.hitStop = 0.16
+          this.shake = 0.95
+        })
+        at(0.8, 3, () => {
+          this.spawnBurst(this.ppos, 9, A.clone())
+          this.hitWhere(this.inRadius(9), 22, 9)
+          this.shake = Math.max(this.shake, 0.45)
+        })
+        break
+      }
+      case 'polearm': {
+        every(0.08, 0.66, 0.1, 10, (i) => {
+          this.hitWhere(this.inRadius(4.2), 11, 6, false)
+          this.spawnArcAt(this.facing + i * 2.1, 4.2, i % 2 ? A : B, 1.2)
+        })
+        at(0.78, 2, () => {
+          const a = this.ppos.clone()
+          const f = this.fwd()
+          const b = a.clone().addScaledVector(f, 8)
+          this.hitWhere((e, d) => {
+            const t = d.dot(f)
+            return t > -0.5 && t < 8 + e.r && d.clone().addScaledVector(f, -t).length() < 1.3 + e.r
+          }, 58, 13)
+          this.spawnLine(a, b, 0.6, A, 0.45)
+          this.spawnLine(a, b, 0.15, new THREE.Color(0xffffff), 0.5)
+          this.hitStop = 0.12
+          this.shake = 0.5
+        })
+        break
+      }
+      case 'fist': {
+        every(0.05, 0.7, 0.0625, 10, (i) => {
+          const n = this.hitWhere(this.inCone(2.7, 0.2), 6, 1.2, false)
+          const p = this.ppos.clone().addScaledVector(this.fwd(), 1.3).setY(1.1 + (Math.random() - 0.5) * 0.5)
+          p.x += (Math.random() - 0.5) * 0.8
+          p.z += (Math.random() - 0.5) * 0.8
+          for (let j = 0; j < 3; j++) this.spawnParticle(p, i % 2 ? A : B, 5, 0.18)
+          if (n) this.hitStop = 0.02
+        })
+        at(0.8, 2, () => {
+          this.hitWhere(this.inCone(3, 0.1), 50, 15)
+          for (let i = 0; i < 30; i++) this.spawnParticle(up(this.ppos.clone().addScaledVector(this.fwd(), 1.2), 0.5), i % 2 ? A : B, 9, 0.7, true)
+          this.spawnBurst(this.ppos.clone().addScaledVector(this.fwd(), 1.4), 2.5)
+          this.hitStop = 0.14
+          this.shake = 0.6
+        })
+        break
+      }
+      case 'gun': {
+        every(0.08, 0.92, 0.035, 10, (i) => {
+          const sweep = Math.sin(((0.08 + i * 0.035) * Math.PI * 2)) * 1.1
+          const a = this.facing + sweep + (Math.random() - 0.5) * 0.12
+          const dir = new THREE.Vector3(Math.sin(a), 0, Math.cos(a))
+          const side = i % 2 ? 1 : -1
+          const right = new THREE.Vector3(Math.cos(this.facing), 0, -Math.sin(this.facing))
+          const pos = this.ppos.clone().setY(1.2).addScaledVector(dir, 0.6).addScaledVector(right, side * 0.25)
+          this.spawnProjectile('bullet', pos, dir, 9, i % 4 === 0)
+          this.spawnParticle(pos, B, 4, 0.12)
+          this.shake = Math.max(this.shake, 0.1)
+        })
+        break
+      }
+      case 'bow': {
+        at(0.42, 1, () => {
+          for (let i = 0; i < 16; i++) this.spawnParticle(up(this.ppos, 1.6), B, 8, 0.6, true)
+        })
+        const target = this.superTarget(8)
+        every(0.55, 0.97, 0.03, 10, () => {
+          const p = target.clone()
+          const r = Math.random() * 3.6
+          const a = Math.random() * Math.PI * 2
+          p.x += Math.cos(a) * r
+          p.z += Math.sin(a) * r
+          this.spawnFallingStreak(p, A)
+          this.later.push({ t: 0.12, fn: () => this.explode(p, 1.3, 10) })
+        })
+        break
+      }
+      case 'cannon': {
+        every(0.15, 0.8, 0.16, 10, (i) => {
+          const targets = this.enemies.filter((e) => !e.dead && e.state !== 'spawn' && e.pos.distanceTo(this.ppos) < 16)
+          const t = targets.length ? targets[i % targets.length].pos.clone() : this.ppos.clone().addScaledVector(this.fwd(), 5 + i * 1.5)
+          this.spawnFallingStreak(t, B, 3)
+          this.spawnBurst(t, 3, A.clone())
+          this.later.push({ t: 0.18, fn: () => this.explode(t, 3.2, 32) })
+          this.shake = Math.max(this.shake, 0.2)
+        })
+        break
+      }
+      case 'flame': {
+        every(0.2, 0.8, 0.2, 10, (i) => {
+          const n = 20
+          for (let j = 0; j < n; j++) {
+            const a = (j / n) * Math.PI * 2 + i * 0.3
+            const dir = new THREE.Vector3(Math.sin(a), 0, Math.cos(a))
+            this.spawnProjectile('flame', this.ppos.clone().setY(0.9).addScaledVector(dir, 0.5), dir, 7, false)
+          }
+          this.spawnBurst(this.ppos, 5.5, i % 2 ? A.clone() : B.clone())
+          this.hitWhere(this.inRadius(2.5), 12, 8, false)
+          this.shake = Math.max(this.shake, 0.25)
+        })
+        break
+      }
+    }
+  }
+
+  /** Świecąca smuga na ziemi od a do b (cięcie, pchnięcie). */
+  private spawnLine(a: THREE.Vector3, b: THREE.Vector3, width: number, color: THREE.Color, life: number) {
+    const L = a.distanceTo(b)
+    if (L < 0.05) return
+    const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending })
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(width, L), mat)
+    m.rotation.order = 'YXZ'
+    m.rotation.set(-Math.PI / 2, Math.atan2(b.x - a.x, b.z - a.z), 0)
+    m.position.copy(a).add(b).multiplyScalar(0.5).setY(0.9)
+    this.scene.add(m)
+    this.bursts.push({ mesh: m, t: 0, max: life, scale: 1, fixed: true })
+  }
+
+  /** Krzyżowe rozcięcie na wrogu. */
+  private spawnCross(at: THREE.Vector3, color: THREE.Color) {
+    for (const r of [0.8, -0.8]) {
+      const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 1, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending })
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(0.12, 2.4), mat)
+      m.position.copy(at).setY(1)
+      m.lookAt(this.camera.position)
+      m.rotateZ(r)
+      this.scene.add(m)
+      this.bursts.push({ mesh: m, t: 0, max: 0.3, scale: 1, fixed: true })
+    }
+    for (let i = 0; i < 10; i++) this.spawnParticle(at.clone().setY(1), color, 6, 0.4)
+  }
+
+  /** Łuk cięcia w dowolnym kierunku i zasięgu. */
+  private spawnArcAt(angle: number, range: number, color: THREE.Color, y: number) {
+    const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.75, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending })
+    const geo = new THREE.RingGeometry(range * 0.5, range, 24, 1, -Math.PI * 0.4, Math.PI * 0.8)
+    const m = new THREE.Mesh(geo, mat)
+    m.rotation.order = 'YXZ'
+    m.rotation.set(-Math.PI / 2, angle - Math.PI / 2, 0)
+    m.position.copy(this.ppos).setY(y)
+    this.scene.add(m)
+    this.bursts.push({ mesh: m, t: 0, max: 0.16, scale: 1 })
+  }
+
+  /** Smuga spadająca z nieba w punkt (strzały, pociski artyleryjskie). */
+  private spawnFallingStreak(at: THREE.Vector3, color: THREE.Color, width = 1) {
+    const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, depthWrite: false, blending: THREE.AdditiveBlending })
+    const m = new THREE.Mesh(this.geo.sphere, mat)
+    m.scale.set(0.05 * width, 2.2, 0.05 * width)
+    m.position.copy(at).setY(9)
+    this.scene.add(m)
+    this.falling.push({ mesh: m, y: 9, speed: 70 })
+  }
+
+  /** Cięcie zwykłego ataku — kształt zależny od stylu broni. */
+  private spawnStyleSlash(big: boolean) {
+    const sp = this.spec
+    switch (this.style) {
+      case 'polearm':
+        if (this.combo === 1) this.spawnArcAt(this.facing, sp.range, this.colorB, 0.9)
+        else this.spawnLine(this.ppos, this.ppos.clone().addScaledVector(this.fwd(), sp.range + 0.5), 0.35, this.colorB, 0.18)
+        break
+      case 'fist':
+        for (let i = 0; i < (big ? 14 : 6); i++) this.spawnParticle(this.ppos.clone().addScaledVector(this.fwd(), 1.2).setY(1.1), i % 2 ? this.colorA : this.colorB, big ? 7 : 4, 0.22, big)
+        if (big) this.spawnBurst(this.ppos.clone().addScaledVector(this.fwd(), 1.3), 1.6)
+        break
+      case 'heavy':
+        this.spawnArcAt(this.facing, sp.range + (big ? 0.5 : 0), this.colorB, big ? 0.3 : 0.8)
+        if (big) this.spawnBurst(this.ppos.clone().addScaledVector(this.fwd(), 1.6), 3.2)
+        break
+      case 'dual':
+        if (big) {
+          this.spawnArcAt(this.facing + 0.6, sp.range, this.colorA, 1.1)
+          this.spawnArcAt(this.facing - 0.6, sp.range, this.colorB, 0.7)
+        } else this.spawnArcAt(this.facing + (this.combo === 0 ? 0.3 : -0.3) * this.flavor.mirror, sp.range * 0.9, this.colorB, 1.0)
+        break
+      default:
+        this.spawnSlash(big)
+    }
+  }
+
+  private spawnProjectile(kind: ProjectileKind, pos: THREE.Vector3, dir: THREE.Vector3, dmg: number, big: boolean) {
+    const mesh = this.makeProjectileMesh(kind, big)
+    mesh.position.copy(pos)
+    mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir)
+    this.scene.add(mesh)
+    this.projectiles.push({ kind, mesh, dir, pos: pos.clone(), travelled: 0, hits: new Set(), dmg, life: PROJECTILE[kind].life })
   }
 
   // ───────────── broń dystansowa ─────────────
@@ -734,7 +1096,7 @@ export class GameEngine {
     const cfg = ENEMY[kind]
     const scale = 1 + (this.wave - 1) * 0.12
     // spawn na ulicy w pobliżu gracza (poza ekranem, ale niedaleko)
-    const pos = this.city.spawnPoint(this.ppos, 11, 22)
+    const pos = this.city.spawnPoint(this.ppos, 12, 26)
     const rig = createEnemyRig(kind, cfg.color)
     const mesh = new THREE.Group()
     mesh.add(rig.root)
@@ -784,7 +1146,7 @@ export class GameEngine {
         }
         case 'chase': {
           if (dist > 0.01) {
-            const desired = toP.clone().divideScalar(dist)
+            const desired = this.city.steer(e.pos, new THREE.Vector3())
             e.pos.addScaledVector(desired, e.speed * dt)
             e.mesh.rotation.y = Math.atan2(desired.x, desired.z)
           }
@@ -979,9 +1341,8 @@ export class GameEngine {
     for (const b of this.bursts) {
       b.t += dt
       const k = Math.min(1, b.t / b.max)
-      const s = b.scale * (0.2 + 0.8 * (1 - (1 - k) ** 3))
-      b.mesh.scale.setScalar(s)
-      ;(b.mesh.material as THREE.MeshBasicMaterial).opacity = 0.7 * (1 - k)
+      if (!b.fixed) b.mesh.scale.setScalar(b.scale * (0.2 + 0.8 * (1 - (1 - k) ** 3)))
+      ;(b.mesh.material as THREE.MeshBasicMaterial).opacity = (b.fixed ? 0.95 : 0.7) * (1 - k)
       if (b.t >= b.max) {
         this.scene.remove(b.mesh)
         ;(b.mesh.material as THREE.Material).dispose()
@@ -989,6 +1350,23 @@ export class GameEngine {
       }
     }
     this.bursts = this.bursts.filter((b) => b.t < b.max)
+
+    // smugi spadające z nieba
+    for (const f of this.falling) {
+      f.y -= f.speed * dt
+      f.mesh.position.y = Math.max(0, f.y)
+      if (f.y <= 0) {
+        this.scene.remove(f.mesh)
+        ;(f.mesh.material as THREE.Material).dispose()
+      }
+    }
+    this.falling = this.falling.filter((f) => f.y > 0)
+    // opóźnione efekty superów
+    for (const l of this.later) {
+      l.t -= dt
+      if (l.t <= 0) l.fn()
+    }
+    this.later = this.later.filter((l) => l.t > 0)
 
     const w = this.container.clientWidth
     const h = this.container.clientHeight
@@ -1038,7 +1416,17 @@ export class GameEngine {
         this.ppos.addScaledVector(this.dodgeDir, DODGE_SPEED * dt * (1 - this.actionT / this.actionDur * 0.6))
         if (Math.random() < 0.6) this.spawnParticle(this.ppos.clone().setY(0.3 + Math.random()), this.colorA, 1, 0.3)
       } else {
-        const mul = this.action === 'light' ? 0.25 : this.action === 'heavy' ? 0 : 1
+        // wypad przy ciosie i ruch superów (przelot iai, pchnięcie)
+        const kk = this.actionDur ? this.actionT / this.actionDur : 0
+        const f = new THREE.Vector3(Math.sin(this.facing), 0, Math.cos(this.facing))
+        if (this.action === 'light' && !this.ranged && kk > 0.15 && kk < 0.45) this.ppos.addScaledVector(f, (this.spec.lunge[this.combo] / (0.3 * this.actionDur)) * dt)
+        if (this.action === 'heavy') {
+          if (this.style === 'blade' && kk > 0.3 && kk < 0.42) this.ppos.addScaledVector(f, (8 / (0.12 * this.actionDur)) * dt)
+          if (this.style === 'polearm' && kk > 0.72 && kk < 0.8) this.ppos.addScaledVector(f, (1.5 / (0.08 * this.actionDur)) * dt)
+          if (this.style === 'fist' && kk < 0.7) this.ppos.addScaledVector(f, 1.2 * dt)
+          if (this.style === 'blade' && kk > 0.3 && kk < 0.42) this.spawnParticle(this.ppos.clone().setY(0.4 + Math.random()), this.colorB, 1, 0.35)
+        }
+        const mul = this.action === 'light' ? 0.25 : this.action === 'heavy' ? (this.style === 'dual' || this.style === 'gun' ? 0.45 : 0) : 1
         const len = inp.length()
         if (len > 0.05) {
           this.ppos.addScaledVector(inp, MOVE_SPEED * mul * dt)
@@ -1077,6 +1465,8 @@ export class GameEngine {
       actionT: this.actionDur ? Math.min(1, this.actionT / this.actionDur) : 0,
       combo: this.combo,
       ranged: this.ranged ? { dual: !!this.ranged.dual, side: this.shotSide } : undefined,
+      style: this.style,
+      flavor: this.flavor,
     })
 
     // waves
@@ -1108,25 +1498,34 @@ export class GameEngine {
     }
 
     // camera follow + shake
-    const camTarget = new THREE.Vector3(this.ppos.x, 0, this.ppos.z)
-    const desired = camTarget.clone().add(new THREE.Vector3(0, 7.2, 8.6))
-    this.camera.position.lerp(desired, 1 - Math.exp(-6 * rawDt))
+    const k = this.keys
+    if (k.has('q')) this.camYaw += rawDt * 2.4
+    if (k.has('e')) this.camYaw -= rawDt * 2.4
+    const camTarget = new THREE.Vector3(this.ppos.x, 1.6, this.ppos.z)
+    const back = new THREE.Vector3(Math.sin(this.camYaw) * Math.cos(this.camPitch), Math.sin(this.camPitch), Math.cos(this.camYaw) * Math.cos(this.camPitch))
+    // ramię kamery skraca się przy ścianach
+    const allowed = this.city.cameraDistance(camTarget, back, 4.6)
+    this.camDist = allowed < this.camDist ? allowed : this.camDist + (allowed - this.camDist) * (1 - Math.exp(-4 * rawDt))
+    // lekko za prawym ramieniem
+    const shoulder = new THREE.Vector3(-back.z, 0, back.x).normalize().multiplyScalar(-0.55 * Math.min(1, this.camDist / 3))
+    const lookAt = camTarget.clone().add(shoulder)
+    this.camera.position.copy(lookAt).addScaledVector(back, this.camDist)
     this.shake = Math.max(0, this.shake - rawDt * 1.8)
     if (this.shake > 0) {
       const s = this.shake * this.shake * 0.6
       this.camera.position.x += (Math.random() - 0.5) * s
       this.camera.position.y += (Math.random() - 0.5) * s
     }
-    this.camera.lookAt(this.camera.position.x, 0.8, this.camera.position.z - 8.6)
+    this.camera.lookAt(lookAt)
 
-    this.sun.position.set(this.ppos.x + 8, 16, this.ppos.z + 6)
+    this.sun.position.set(this.ppos.x + 14, 40, this.ppos.z - 18)
     this.sun.target.position.copy(this.ppos)
     this.city.update(this.time, rawDt, this.ppos, this.camera.position)
     this.minimapT -= rawDt
     if (this.minimapT <= 0) {
       this.minimapT = 0.1
       const mctx = this.minimap.getContext('2d')
-      if (mctx) this.city.drawMinimap(mctx, this.minimap.width, this.ppos, this.facing, this.enemies.map((e) => e.pos))
+      if (mctx) this.city.drawMinimap(mctx, this.minimap.width, this.ppos, this.facing, this.enemies.map((e) => e.pos), this.camYaw)
     }
     this.dust.rotation.y += rawDt * 0.01
     for (const s of this.spinners) s.rotation.y += rawDt * 1.5
@@ -1142,7 +1541,7 @@ export class GameEngine {
       hp: this.hp,
       maxHp: this.maxHp,
       special: this.specialCd,
-      specialMax: HEAVY_CD,
+      specialMax: this.spec.superCd,
       dodge: this.dodgeCd,
       wave: this.wave,
       kills: this.kills,
@@ -1154,10 +1553,12 @@ export class GameEngine {
       credit: this.avatar?.credit,
       gameOver: this.gameOver,
       banner: this.banner,
+      superName: this.spec.superName,
     })
   }
 
   restart() {
+    this.later = []
     for (const e of this.enemies) {
       this.scene.remove(e.mesh)
       e.rig.dispose()
@@ -1166,7 +1567,7 @@ export class GameEngine {
     this.enemies = []
     this.toSpawn = []
     this.hp = this.maxHp
-    this.ppos.set(4, 0, 5)
+    this.ppos.copy(this.city.start)
     this.earned = 0
     this.facing = 0
     this.action = 'none'

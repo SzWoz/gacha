@@ -368,6 +368,7 @@ table.history { width: 100%; border-collapse: collapse; background: rgba(7,6,13,
 .dmg.crit { font-size: 32px; color: var(--el, #ffcc00); }
 .dmg.hurt { color: #ff3e5a; font-size: 26px; }
 .dmg.heal { color: #7cffd4; }
+.dmg.super { font-size: 22px; letter-spacing: .06em; color: #fff; text-transform: uppercase; text-shadow: 0 0 14px var(--el, #7cffd4), 0 2px 0 #000; white-space: nowrap; }
 .dmg.coin { color: #ffb800; font-size: 20px; text-shadow: 0 0 10px rgba(255,184,0,.7), 0 2px 0 #000; }
 .hud-stat.coin b { color: #ffb800; }
 .game-minimap {
