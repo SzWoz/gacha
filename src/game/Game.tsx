@@ -5,14 +5,16 @@ import { GameEngine, type GameAction, type HudState } from './engine'
 
 const isTouch = () => typeof window !== 'undefined' && (window.matchMedia?.('(pointer: coarse)').matches || 'ontouchstart' in window)
 
-export function Game({ agent, onExit, onChangeAgent }: { agent: Item; onExit: () => void; onChangeAgent: () => void }) {
+export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; onExit: () => void; onChangeAgent: () => void; onReward?: (amount: number) => void }) {
+  const rewardRef = useRef(onReward)
+  rewardRef.current = onReward
   const mount = useRef<HTMLDivElement>(null)
   const engine = useRef<GameEngine | null>(null)
   const [hud, setHud] = useState<HudState | null>(null)
   const [touch] = useState(isTouch)
 
   useEffect(() => {
-    const eng = new GameEngine(mount.current!, { agent, onHud: setHud })
+    const eng = new GameEngine(mount.current!, { agent, onHud: setHud, onReward: (n) => rewardRef.current?.(n) })
     engine.current = eng
     return () => {
       eng.dispose()
@@ -71,6 +73,9 @@ export function Game({ agent, onExit, onChangeAgent }: { agent: Item; onExit: ()
           </div>
           <div className="hud-stat">
             Wynik <b>{(hud?.score ?? 0).toLocaleString()}</b>
+          </div>
+          <div className="hud-stat coin">
+            Zarobione <b>+{(hud?.earned ?? 0).toLocaleString()} ◈</b>
           </div>
           <div className="hud-stat muted">Wrogowie: {hud?.enemies ?? 0}</div>
         </div>

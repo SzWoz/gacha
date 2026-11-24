@@ -6,7 +6,7 @@ import { sfx } from '../lib/sfx'
 import { Game } from './Game'
 
 /** "play" tab: pick an owned agent, then drop into the arena. */
-export function PlayView({ owned, onInGame }: { owned: Record<string, number>; onInGame: (v: boolean) => void }) {
+export function PlayView({ owned, onInGame, onReward }: { owned: Record<string, number>; onInGame: (v: boolean) => void; onReward?: (amount: number) => void }) {
   const [agent, setAgent] = useState<Item | null>(null)
   const agents = ITEMS.filter((i) => i.kind === 'agent')
   const mine = agents.filter((i) => owned[i.id])
@@ -22,12 +22,12 @@ export function PlayView({ owned, onInGame }: { owned: Record<string, number>; o
     onInGame(false)
   }, [onInGame])
 
-  if (agent) return <Game agent={agent} onExit={exit} onChangeAgent={exit} />
+  if (agent) return <Game agent={agent} onExit={exit} onChangeAgent={exit} onReward={onReward} />
 
   return (
     <div className="page">
       <header className="page-head">
-        <h2>ARENA · WYBIERZ AGENTA</h2>
+        <h2>NEW ERIDU · WYBIERZ AGENTA</h2>
         <span className="muted">{mine.length ? `${mine.length} dostępnych` : 'Nie masz jeszcze agentów — wylosuj agentów w bannerach (na razie możesz grać każdym)'}</span>
       </header>
       <div className="collection-grid">

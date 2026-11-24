@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import { buildCity, CITY_HALF, pushOutOfBoxes, type City } from './city'
 import { ELEMENT_COLORS, type Item } from '../data/roster'
 import {
   createPlaceholderAvatar,
@@ -7,11 +8,11 @@ import {
   type ActionKind,
   type Avatar,
 } from './avatar'
+import { PROJECTILE, rangedWeaponFor, type ProjectileKind, type RangedWeapon } from './weapons'
 import { createEnemyRig, disposeEnemyGeometries, type EnemyKind, type EnemyRig } from './enemies'
 
 // ───────────────────────── tuning ─────────────────────────
 
-const ARENA = 18 // half-size of the playable square
 const PLAYER_R = 0.45
 const MOVE_SPEED = 7
 const LIGHT_DUR = [0.3, 0.3, 0.42]
@@ -42,6 +43,8 @@ export interface HudState {
   wave: number
   kills: number
   score: number
+  /** ◈ zarobione w tym podejściu */
+  earned: number
   enemies: number
   loading: boolean
   modelKind: 'model' | 'placeholder' | null
@@ -71,6 +74,17 @@ interface Enemy {
   seed: number
 }
 
+interface Projectile {
+  kind: ProjectileKind
+  mesh: THREE.Object3D
+  dir: THREE.Vector3
+  pos: THREE.Vector3
+  travelled: number
+  hits: Set<Enemy>
+  dmg: number
+  life: number
+}
+
 interface Particle {
   mesh: THREE.Mesh
   vel: THREE.Vector3
@@ -94,7 +108,13 @@ interface Floater {
 export interface EngineOptions {
   agent: Item
   onHud: (h: HudState) => void
+  /** ◈ zarobione za pokonanie wroga / falę — od razu trafia do zapisu gachy */
+  onReward?: (amount: number) => void
 }
+
+/** Nagrody w ◈ (waluta gachy) */
+const KILL_REWARD: Record<EnemyKind, number> = { grunt: 10, spiker: 14, brute: 60 }
+const waveBonus = (wave: number) => 50 + wave * 25
 
 // ───────────────────────── engine ─────────────────────────
 
@@ -127,6 +147,10 @@ export class GameEngine {
   private comboTimer = 0
   private queuedAttack = false
   private swingHit = false
+  /** broń dystansowa agenta (null = walka wręcz) */
+  private ranged: RangedWeapon | null = null
+  private projectiles: Projectile[] = []
+  private shotSide = 1
   private specialCd = 0
   private dodgeCd = 0
   private iframes = 0
@@ -163,6 +187,11 @@ export class GameEngine {
   private hudT = 0
   private loading = true
   private onHud: (h: HudState) => void
+  private onReward?: (amount: number) => void
+  private earned = 0
+  private city!: City
+  private minimap!: HTMLCanvasElement
+  private minimapT = 0
 
   // shared geometries/materials
   private geo = {
@@ -177,7 +206,9 @@ export class GameEngine {
   constructor(container: HTMLElement, opts: EngineOptions) {
     this.container = container
     this.onHud = opts.onHud
+    this.onReward = opts.onReward
     const agent = opts.agent
+    this.ranged = rangedWeaponFor(agent.name)
     const [c1, c2] = agent.element ? ELEMENT_COLORS[agent.element] : ['#7cffd4', '#ffffff']
     this.colorA = new THREE.Color(c1)
     this.colorB = new THREE.Color(c2)
@@ -226,7 +257,7 @@ export class GameEngine {
   private buildArena() {
     const s = this.scene
     s.background = new THREE.Color(0x07060d)
-    s.fog = new THREE.Fog(0x07060d, 18, 55)
+    s.fog = new THREE.Fog(0x0a0814, 26, 80)
 
     s.add(new THREE.HemisphereLight(0x8fa8ff, 0x1a0f2a, 1.1))
     const amb = new THREE.AmbientLight(0xffffff, 0.35)
@@ -248,99 +279,15 @@ export class GameEngine {
     rim.position.set(0, 3, 0)
     this.player.add(rim)
 
-    // floor: neon grid shader
-    const floorMat = new THREE.ShaderMaterial({
-      uniforms: {
-        uTime: { value: 0 },
-        uColor: { value: new THREE.Color(0x7cffd4) },
-        uAccent: { value: this.colorA.clone() },
-        uSize: { value: ARENA },
-        fogColor: { value: new THREE.Color(0x07060d) },
-      },
-      vertexShader: `varying vec2 vW; void main(){ vec4 w = modelMatrix*vec4(position,1.); vW = w.xz; gl_Position = projectionMatrix*viewMatrix*w; }`,
-      fragmentShader: `
-        uniform float uTime; uniform vec3 uColor; uniform vec3 uAccent; uniform float uSize; varying vec2 vW;
-        void main(){
-          vec2 g = vW/2.;
-          vec2 a = abs(fract(g-0.5)-0.5)/fwidth(g);
-          float line = 1.0 - min(min(a.x,a.y),1.0);
-          float d = max(abs(vW.x), abs(vW.y));
-          float inside = step(d, uSize);
-          float edge = smoothstep(uSize-1.5, uSize, d) * inside;
-          float r = length(vW);
-          float pulse = 0.5+0.5*sin(r*0.6-uTime*2.);
-          vec3 base = vec3(0.035,0.03,0.06);
-          vec3 col = base + uColor*line*(0.18+0.25*pulse)*inside + uAccent*edge*0.6;
-          col += uColor*line*0.05*(1.-inside);
-          float fade = smoothstep(60., 20., r);
-          gl_FragColor = vec4(mix(vec3(0.027,0.024,0.05), col, fade), 1.);
-        }`,
-    })
-    this.floorMat = floorMat
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(160, 160), floorMat)
-    floor.rotation.x = -Math.PI / 2
-    s.add(floor)
-    // invisible shadow receiver on top
-    const shadowFloor = new THREE.Mesh(new THREE.PlaneGeometry(ARENA * 2 + 4, ARENA * 2 + 4), new THREE.ShadowMaterial({ opacity: 0.45 }))
-    shadowFloor.rotation.x = -Math.PI / 2
-    shadowFloor.position.y = 0.01
-    shadowFloor.receiveShadow = true
-    s.add(shadowFloor)
+    // miasto: ulice, budynki, plac, latarnie, auta
+    this.city = buildCity(s, this.colorA)
+    this.ppos.set(4, 0, 5)
 
-    // boundary: glowing rails
-    const railMat = new THREE.MeshStandardMaterial({ color: 0x7cffd4, emissive: 0x7cffd4, emissiveIntensity: 1.6 })
-    const railGeo = new THREE.BoxGeometry(ARENA * 2 + 0.4, 0.15, 0.15)
-    for (let i = 0; i < 4; i++) {
-      const rail = new THREE.Mesh(railGeo, railMat)
-      const a = (i * Math.PI) / 2
-      rail.position.set(Math.sin(a) * (ARENA + 0.2), 0.6, Math.cos(a) * (ARENA + 0.2))
-      rail.rotation.y = a
-      s.add(rail)
-    }
-    // corner pylons
-    const pyGeo = new THREE.CylinderGeometry(0.35, 0.5, 4, 6)
-    const pyMat = new THREE.MeshStandardMaterial({ color: 0x15121f, roughness: 0.6, metalness: 0.4 })
-    const capMat = new THREE.MeshStandardMaterial({ color: this.colorA, emissive: this.colorA, emissiveIntensity: 2 })
-    const capGeo = new THREE.OctahedronGeometry(0.4, 0)
-    for (const [x, z] of [
-      [ARENA, ARENA],
-      [-ARENA, ARENA],
-      [ARENA, -ARENA],
-      [-ARENA, -ARENA],
-    ]) {
-      const p = new THREE.Mesh(pyGeo, pyMat)
-      p.position.set(x, 2, z)
-      s.add(p)
-      const cap = new THREE.Mesh(capGeo, capMat)
-      cap.position.set(x, 4.5, z)
-      s.add(cap)
-      this.spinners.push(cap)
-    }
-
-    // props: cover pillars / crates (collidable)
-    const crateGeo = new THREE.BoxGeometry(1.6, 1.6, 1.6)
-    const crateMat = new THREE.MeshStandardMaterial({ color: 0x221d33, roughness: 0.7, metalness: 0.2, emissive: 0x7cffd4, emissiveIntensity: 0.04 })
-    const edgeMat = new THREE.LineBasicMaterial({ color: 0x7cffd4, transparent: true, opacity: 0.6 })
-    const edges = new THREE.EdgesGeometry(crateGeo)
-    const spots: [number, number][] = [
-      [-8, -6],
-      [9, -7],
-      [-10, 8],
-      [7, 9],
-      [0, -12],
-      [13, 1],
-      [-14, -1],
-    ]
-    for (const [x, z] of spots) {
-      const c = new THREE.Mesh(crateGeo, crateMat)
-      c.position.set(x, 0.8, z)
-      c.rotation.y = (x * 0.37 + z) % Math.PI
-      c.castShadow = true
-      c.receiveShadow = true
-      c.add(new THREE.LineSegments(edges, edgeMat))
-      s.add(c)
-      this.props.push({ pos: new THREE.Vector3(x, 0, z), r: 1.15 })
-    }
+    // minimapa
+    this.minimap = document.createElement('canvas')
+    this.minimap.className = 'game-minimap'
+    this.minimap.width = this.minimap.height = 160
+    this.container.appendChild(this.minimap)
 
     // floating dust
     const n = 300
@@ -356,10 +303,9 @@ export class GameEngine {
     this.dust = new THREE.Points(dustGeo, dustMat)
     s.add(this.dust)
 
-    this.disposables.push(floorMat, floor.geometry, shadowFloor.geometry, shadowFloor.material as THREE.Material, railMat, railGeo, pyGeo, pyMat, capMat, capGeo, crateGeo, crateMat, edgeMat, edges, dustGeo, dustMat)
+    this.disposables.push(dustGeo, dustMat)
   }
   private sun!: THREE.DirectionalLight
-  private floorMat!: THREE.ShaderMaterial
   private dust!: THREE.Points
   private spinners: THREE.Object3D[] = []
 
@@ -481,7 +427,7 @@ export class GameEngine {
   private startLight() {
     const inp = this.moveInput(new THREE.Vector3())
     if (inp.lengthSq() > 0.01) this.facing = Math.atan2(inp.x, inp.z)
-    this.faceNearest(4)
+    this.faceNearest(this.ranged ? PROJECTILE[this.ranged.kind].range : 4)
     if (this.comboTimer <= 0) this.combo = 0
     this.action = 'light'
     this.actionT = 0
@@ -519,8 +465,12 @@ export class GameEngine {
     if (this.swingHit) return
     if (this.action === 'light') {
       const k = this.actionT / this.actionDur
-      if (k < 0.35) return
+      if (k < (this.ranged ? 0.2 : 0.35)) return
       this.swingHit = true
+      if (this.ranged) {
+        this.fireRanged(this.combo === 2)
+        return
+      }
       const fx = Math.sin(this.facing)
       const fz = Math.cos(this.facing)
       const isFinisher = this.combo === 2
@@ -564,6 +514,137 @@ export class GameEngine {
     }
   }
 
+  // ───────────── broń dystansowa ─────────────
+
+  private fireRanged(finisher: boolean) {
+    const w = this.ranged!
+    const spec = PROJECTILE[w.kind]
+    const count = w.kind === 'flame' ? 7 : (w.burst ?? 1) + (finisher ? 1 : 0)
+    for (let i = 0; i < count; i++) {
+      const side = w.dual ? (this.shotSide = -this.shotSide) : -1 // -1 = prawa ręka
+      const spread = w.kind === 'flame' ? (Math.random() - 0.5) * 0.7 : count > 1 ? (i - (count - 1) / 2) * 0.07 : 0
+      const a = this.facing + spread
+      const dir = new THREE.Vector3(Math.sin(a), 0, Math.cos(a))
+      const right = new THREE.Vector3(Math.cos(this.facing), 0, -Math.sin(this.facing))
+      // z wysokości dłoni, odrobinę przed postacią
+      const pos = this.ppos.clone().setY(1.2).addScaledVector(dir, 0.6).addScaledVector(right, side * -0.28)
+      const mesh = this.makeProjectileMesh(w.kind, finisher)
+      mesh.position.copy(pos)
+      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir)
+      this.scene.add(mesh)
+      const delay = w.kind === 'flame' ? 0 : i * 0.06 // seria: kolejne pociski lekko z tyłu
+      pos.addScaledVector(dir, -delay * spec.speed)
+      this.projectiles.push({
+        kind: w.kind,
+        mesh,
+        dir,
+        pos,
+        travelled: -delay * spec.speed,
+        hits: new Set(),
+        dmg: spec.dmg * (finisher ? 1.6 : 1),
+        life: spec.life + delay,
+      })
+      // błysk z lufy
+      if (w.kind !== 'flame' && i === 0) for (let k = 0; k < 4; k++) this.spawnParticle(pos.clone(), this.colorB, 4, 0.15)
+    }
+    this.shake = Math.max(this.shake, w.kind === 'shell' ? 0.2 : 0.08)
+  }
+
+  private makeProjectileMesh(kind: ProjectileKind, big: boolean): THREE.Object3D {
+    const add = { transparent: true, blending: THREE.AdditiveBlending, depthWrite: false } as const
+    const g = new THREE.Group()
+    const s = big ? 1.4 : 1
+    if (kind === 'bullet' || kind === 'arrow') {
+      const len = kind === 'arrow' ? 1.3 : 0.7
+      const core = new THREE.Mesh(this.geo.sphere, new THREE.MeshBasicMaterial({ color: 0xffffff }))
+      core.scale.set(0.05 * s, 0.05 * s, len * 0.5)
+      const glow = new THREE.Mesh(this.geo.sphere, new THREE.MeshBasicMaterial({ color: this.colorA, opacity: 0.7, ...add }))
+      glow.scale.set(0.14 * s, 0.14 * s, len * 0.7)
+      g.add(core, glow)
+    } else if (kind === 'shell') {
+      const core = new THREE.Mesh(this.geo.sphere, new THREE.MeshBasicMaterial({ color: 0xffffff }))
+      core.scale.setScalar(0.18 * s)
+      const glow = new THREE.Mesh(this.geo.sphere, new THREE.MeshBasicMaterial({ color: this.colorA, opacity: 0.55, ...add }))
+      glow.scale.setScalar(0.42 * s)
+      g.add(core, glow)
+    } else {
+      const puff = new THREE.Mesh(this.geo.sphere, new THREE.MeshBasicMaterial({ color: Math.random() < 0.5 ? this.colorA : this.colorB, opacity: 0.8, ...add }))
+      puff.scale.setScalar(0.25)
+      g.add(puff)
+    }
+    return g
+  }
+
+  private updateProjectiles(dt: number) {
+    for (const p of this.projectiles) {
+      const spec = PROJECTILE[p.kind]
+      p.life -= dt
+      const step = spec.speed * dt
+      p.pos.addScaledVector(p.dir, step)
+      p.travelled += step
+      p.mesh.position.copy(p.pos)
+      p.mesh.visible = p.travelled > 0
+      if (p.kind === 'flame') {
+        const k = Math.max(0, p.travelled / spec.range)
+        p.mesh.scale.setScalar(1 + k * 3)
+        p.mesh.traverse((o) => {
+          const m = (o as THREE.Mesh).material as THREE.MeshBasicMaterial | undefined
+          if (m) m.opacity = 0.8 * (1 - k)
+        })
+      }
+      if (p.travelled <= 0) continue
+      // trafienia
+      for (const e of this.enemies) {
+        if (e.dead || e.state === 'spawn' || p.hits.has(e)) continue
+        const dx = e.pos.x - p.pos.x
+        const dz = e.pos.z - p.pos.z
+        if (Math.hypot(dx, dz) > e.r + spec.radius) continue
+        p.hits.add(e)
+        if (spec.splash > 0) {
+          this.explode(p.pos, spec.splash, p.dmg)
+          p.life = 0
+          break
+        }
+        const dmg = Math.round(p.dmg * this.dmgMul * (0.9 + Math.random() * 0.2))
+        this.damageEnemy(e, dmg, p.kind === 'flame' ? 1 : 3, false)
+        if (p.kind !== 'flame') this.hitStop = Math.max(this.hitStop, 0.02)
+        if (p.hits.size >= spec.pierce) {
+          p.life = 0
+          break
+        }
+      }
+      if (p.travelled > spec.range) {
+        if (spec.splash > 0 && p.life > 0) this.explode(p.pos, spec.splash, p.dmg)
+        p.life = 0
+      }
+      // pociski zatrzymują się na budynkach
+      const before = p.pos.clone()
+      this.collide(p.pos, 0.05)
+      if (p.pos.distanceToSquared(before) > 1e-6) {
+        if (spec.splash > 0 && p.life > 0) this.explode(before, spec.splash, p.dmg)
+        else for (let k = 0; k < 3; k++) this.spawnParticle(before, this.colorB, 3, 0.2)
+        p.life = 0
+      }
+    }
+    for (const p of this.projectiles) {
+      if (p.life > 0) continue
+      this.scene.remove(p.mesh)
+      p.mesh.traverse((o) => ((o as THREE.Mesh).material as THREE.Material | undefined)?.dispose())
+    }
+    this.projectiles = this.projectiles.filter((p) => p.life > 0)
+  }
+
+  private explode(at: THREE.Vector3, radius: number, dmg: number) {
+    this.spawnBurst(at.clone().setY(0.05), radius)
+    for (let i = 0; i < 14; i++) this.spawnParticle(at.clone(), i % 2 ? this.colorA : this.colorB, 7, 0.5)
+    this.shake = Math.max(this.shake, 0.25)
+    for (const e of this.enemies) {
+      if (e.dead || e.state === 'spawn') continue
+      if (e.pos.distanceTo(at) > radius + e.r) continue
+      this.damageEnemy(e, Math.round(dmg * this.dmgMul * (0.9 + Math.random() * 0.2)), 6, true)
+    }
+  }
+
   private damageEnemy(e: Enemy, dmg: number, knock: number, crit: boolean) {
     e.hp -= dmg
     e.flash = 0.12
@@ -586,6 +667,7 @@ export class GameEngine {
     e.dead = true
     this.kills++
     this.score += ENEMY[e.kind].score * this.wave
+    this.reward(KILL_REWARD[e.kind] + Math.floor(this.wave / 3) * 2, e.pos.clone().setY(e.r * 2 + 1))
     const c = new THREE.Color(ENEMY[e.kind].color)
     const n = e.kind === 'brute' ? 50 : 22
     for (let i = 0; i < n; i++) this.spawnParticle(e.pos.clone().setY(e.r), i % 3 ? c : this.colorB, e.kind === 'brute' ? 9 : 6, 0.8)
@@ -623,7 +705,14 @@ export class GameEngine {
 
   // ───────────── waves & enemies ─────────────
 
+  private reward(amount: number, at: THREE.Vector3) {
+    this.earned += amount
+    this.onReward?.(amount)
+    this.floatText(at, `+${amount} ◈`, 'coin')
+  }
+
   private startWave() {
+    if (this.wave > 0) this.reward(waveBonus(this.wave), this.ppos.clone().setY(2.8))
     this.wave++
     const n = this.wave
     const list: EnemyKind[] = []
@@ -644,18 +733,8 @@ export class GameEngine {
   private spawnEnemy(kind: EnemyKind) {
     const cfg = ENEMY[kind]
     const scale = 1 + (this.wave - 1) * 0.12
-    // spawn at a random edge point, away from the player
-    const pos = new THREE.Vector3()
-    for (let tries = 0; tries < 8; tries++) {
-      const side = Math.floor(Math.random() * 4)
-      const t = (Math.random() * 2 - 1) * (ARENA - 1.5)
-      const edge = ARENA - 1.2
-      if (side === 0) pos.set(t, 0, edge)
-      else if (side === 1) pos.set(t, 0, -edge)
-      else if (side === 2) pos.set(edge, 0, t)
-      else pos.set(-edge, 0, t)
-      if (pos.distanceTo(this.ppos) > 8) break
-    }
+    // spawn na ulicy w pobliżu gracza (poza ekranem, ale niedaleko)
+    const pos = this.city.spawnPoint(this.ppos, 11, 22)
     const rig = createEnemyRig(kind, cfg.color)
     const mesh = new THREE.Group()
     mesh.add(rig.root)
@@ -804,7 +883,8 @@ export class GameEngine {
         }
       }
     }
-    const lim = ARENA - r
+    pushOutOfBoxes(p, r, this.city.boxes)
+    const lim = CITY_HALF - r
     p.x = THREE.MathUtils.clamp(p.x, -lim, lim)
     p.z = THREE.MathUtils.clamp(p.z, -lim, lim)
   }
@@ -996,6 +1076,7 @@ export class GameEngine {
       action: this.action,
       actionT: this.actionDur ? Math.min(1, this.actionT / this.actionDur) : 0,
       combo: this.combo,
+      ranged: this.ranged ? { dual: !!this.ranged.dual, side: this.shotSide } : undefined,
     })
 
     // waves
@@ -1015,6 +1096,7 @@ export class GameEngine {
       }
     }
     this.updateEnemies(dt)
+    this.updateProjectiles(dt)
     this.updateVfx(dt)
 
     if (this.bannerT > 0) {
@@ -1039,7 +1121,13 @@ export class GameEngine {
 
     this.sun.position.set(this.ppos.x + 8, 16, this.ppos.z + 6)
     this.sun.target.position.copy(this.ppos)
-    this.floorMat.uniforms.uTime.value = this.time
+    this.city.update(this.time, rawDt, this.ppos, this.camera.position)
+    this.minimapT -= rawDt
+    if (this.minimapT <= 0) {
+      this.minimapT = 0.1
+      const mctx = this.minimap.getContext('2d')
+      if (mctx) this.city.drawMinimap(mctx, this.minimap.width, this.ppos, this.facing, this.enemies.map((e) => e.pos))
+    }
     this.dust.rotation.y += rawDt * 0.01
     for (const s of this.spinners) s.rotation.y += rawDt * 1.5
 
@@ -1059,6 +1147,7 @@ export class GameEngine {
       wave: this.wave,
       kills: this.kills,
       score: this.score,
+      earned: this.earned,
       enemies: this.enemies.length + this.toSpawn.length,
       loading: this.loading,
       modelKind: this.avatar?.kind ?? null,
@@ -1077,7 +1166,8 @@ export class GameEngine {
     this.enemies = []
     this.toSpawn = []
     this.hp = this.maxHp
-    this.ppos.set(0, 0, 0)
+    this.ppos.set(4, 0, 5)
+    this.earned = 0
     this.facing = 0
     this.action = 'none'
     this.actionT = 0
@@ -1116,6 +1206,8 @@ export class GameEngine {
     this.renderer.forceContextLoss()
     this.renderer.domElement.remove()
     this.overlay.remove()
+    this.minimap.remove()
+    this.city.dispose()
     this.container.classList.remove('hurt')
   }
 }
