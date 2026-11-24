@@ -138,6 +138,12 @@ export function attachOriginalWeapons(model: THREE.Object3D, rHand: THREE.Object
     if (bone.parent !== hand) hand.add(bone)
     bone.position.set(0, 0, 0)
     bone.quaternion.identity()
+    // korzeń broni pod Propem bywa sam odsunięty w pozie wystawowej (np. karabin Zhu Yuan) — też do dłoni
+    const handLen = hand.position.length() || armLen
+    for (const c of bone.children) {
+      if ((c as THREE.Mesh).isMesh || c.position.length() < handLen * 1.5) continue
+      c.position.set(0, 0, 0)
+    }
   }
   const propOf = (hand: THREE.Object3D) => props.find((p) => p.hand === hand)?.bone
   const filled = new Set(props.filter((p) => hasWeaponMesh(model, p.bone)).map((p) => p.hand))
