@@ -105,7 +105,7 @@ const GEAR_KINDS: Kind[] = ['gear', 'bangboo']
 const gearS = itemsOf('S', GEAR_KINDS)
 const gearA = itemsOf('A', GEAR_KINDS)
 const findIn = (pool: Item[], name: string) => (pool.find((i) => i.name === name) ?? pool[0])?.id
-const gearFeaturedS = findIn(gearS, 'Deep Sea Visitor')
+const gearFeaturedS = findIn(gearS, 'Sharpened Stinger')
 const gearFeaturedA = [findIn(gearA, 'Steel Cushion'), findIn(gearA, 'Luckyboo')].filter((x, i, a): x is string => !!x && a.indexOf(x) === i)
 
 const STANDARD_S = agentsOf('S').map((i) => i.id)
@@ -119,7 +119,7 @@ export const BANNERS: Banner[] = [
   {
     id: 'lim-1',
     kind: 'limited',
-    name: 'Overclock Rush',
+    name: 'No Match Found',
     subtitle: 'Exclusive Channel',
     featuredS: lim1S,
     featuredA: lim1A,
@@ -129,7 +129,7 @@ export const BANNERS: Banner[] = [
   {
     id: 'lim-2',
     kind: 'limited',
-    name: 'Furnace Heart',
+    name: 'Born to Burn',
     subtitle: 'Exclusive Channel',
     featuredS: lim2S,
     featuredA: lim2A,
@@ -139,8 +139,8 @@ export const BANNERS: Banner[] = [
   {
     id: 'gear',
     kind: 'gear',
-    name: 'Arsenal Signal',
-    subtitle: 'W-Engine & Bangboo Channel',
+    name: 'Dissonant Sonata',
+    subtitle: 'W-Engine Channel',
     featuredS: gearFeaturedS,
     featuredA: gearFeaturedA,
     standardS: gearS.map((i) => i.id).filter((id) => id !== gearFeaturedS),
@@ -150,8 +150,8 @@ export const BANNERS: Banner[] = [
   {
     id: 'standard',
     kind: 'standard',
-    name: 'Stable Frequency',
-    subtitle: 'Standard Channel',
+    name: 'Stable Channel',
+    subtitle: 'Permanent Channel',
     standardS: STANDARD_S,
     accent: '#ffb800',
   },
