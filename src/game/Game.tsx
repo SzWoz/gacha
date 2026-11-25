@@ -66,7 +66,7 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
                   <em key={k} className={hud && k < hud.dodge ? 'on' : ''} />
                 ))}
               </b>
-              <small>{hud?.counter ? 'KONTRA' : 'UNIK ⇧'}</small>
+              <small>{hud?.counter ? 'KONTRA' : 'UNIK Q'}</small>
             </div>
           </div>
         </div>
@@ -92,12 +92,12 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
         </button>
         {!touch && (
           <div className="game-help">
-            <span><b>Klik</b> złap mysz · <b>Mysz</b>/<b>Q E</b> kamera</span>
+            <span><b>Klik</b> złap mysz · <b>Mysz</b>/<b>Z C</b> kamera</span>
             <span><b>WASD</b> ruch</span>
             <span><b>J</b>/<b>LPM</b> atak (combo ×3)</span>
             <span><b>K</b>/<b>PPM</b> specjalny</span>
-            <span><b>Spacja</b> skok</span>
-            <span><b>Shift</b> unik ×2 (też w locie, tuż przed ciosem = kontra)</span>
+            <span><b>Spacja</b> skok (2× = salto)</span>
+            <span><b>Q</b> unik ×2 (też w locie, tuż przed ciosem = kontra)</span>
             <span><b>Esc</b> wyjście</span>
           </div>
         )}

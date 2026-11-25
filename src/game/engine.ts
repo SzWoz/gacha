@@ -25,6 +25,8 @@ const COMBO_WINDOW = 0.45
 const DODGE_DUR = 0.22
 const DODGE_SPEED = 19
 const DODGE_IFRAMES = 0.35
+const DOUBLE_JUMP_V = 9.6
+const FLIP_DUR = 0.5
 const DODGE_CD = 0.22
 const DODGE_CHARGES = 2
 const DODGE_RECHARGE = 1.1
@@ -190,6 +192,11 @@ export class GameEngine {
   private body: Body = { pos: this.ppos, vel: new THREE.Vector3(), vy: 0, grounded: true, r: PLAYER_R, player: true }
   private coyote = 0
   private jumpBuf = 0
+  /** podwójny skok: zużyty w tym locie? + postęp salta (0..1, -1 = brak) */
+  private doubleUsed = false
+  private flipT = -1
+  /** obraca się przy salcie — środek obrotu na wysokości bioder */
+  private flipPivot = new THREE.Group()
   private lastSafe = new THREE.Vector3()
   private camY = 1.6
   private hemi!: THREE.HemisphereLight
@@ -433,7 +440,10 @@ export class GameEngine {
     }
     av ??= createPlaceholderAvatar(c1, c2)
     this.avatar = av
-    this.player.add(av.root)
+    this.flipPivot.position.y = 0.95
+    av.root.position.y = -0.95
+    this.flipPivot.add(av.root)
+    if (!this.flipPivot.parent) this.player.add(this.flipPivot)
     this.loading = false
     this.emitHud(true)
   }
@@ -453,7 +463,7 @@ export class GameEngine {
       if (k === 'j') this.trigger('attack')
       else if (k === 'k') this.trigger('special')
       else if (k === ' ') this.trigger('jump')
-      else if (k === 'shift' || k === 'l') this.trigger('dodge')
+      else if (k === 'q' || k === 'shift' || k === 'l') this.trigger('dodge')
     })
     on(window, 'keyup', (e) => this.keys.delete(e.key.toLowerCase()))
     on(window, 'blur', () => this.keys.clear())
@@ -1350,10 +1360,23 @@ export class GameEngine {
       b.grounded = false
       this.coyote = 0
       this.jumpBuf = 0
+      this.doubleUsed = false
+    } else if (this.jumpBuf > 0 && !b.grounded && !this.doubleUsed && this.action !== 'heavy') {
+      // podwójny skok z saltem
+      b.vy = DOUBLE_JUMP_V
+      this.doubleUsed = true
+      this.jumpBuf = 0
+      this.flipT = 0
+      if (this.action === 'dodge') this.action = 'none'
+      this.spawnBurst(this.ppos.clone(), 1.1, this.colorB)
+      for (let i = 0; i < 10; i++) this.spawnParticle(this.ppos.clone().setY(this.ppos.y + 0.2), this.colorB, 3, 0.4)
       for (let i = 0; i < 6; i++) this.spawnParticle(this.ppos.clone().setY(this.ppos.y + 0.1), this.colorA, 2, 0.35)
     }
     if (this.action === 'dodge' && !b.grounded) b.vy = Math.max(b.vy, 0.6) // zryw: chwilowo bez spadania
-    if (b.grounded) this.airDashUsed = false
+    if (b.grounded) {
+      this.airDashUsed = false
+      this.doubleUsed = false
+    }
     this.collide(this.ppos, PLAYER_R)
     const impact = this.integrate(b, dt)
     if (impact > 9) {
@@ -1997,6 +2020,18 @@ export class GameEngine {
     this.speedFactor = THREE.MathUtils.lerp(this.speedFactor, moveSpeed, Math.min(1, dt * 12))
     this.player.position.copy(this.ppos)
     this.player.rotation.y = this.facing
+    // salto w przód przy podwójnym skoku
+    if (this.flipT >= 0) {
+      this.flipT += rawDt / FLIP_DUR
+      const k = Math.min(1, this.flipT)
+      const e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2
+      this.flipPivot.rotation.x = e * Math.PI * 2
+      if (k > 0.2 && k < 0.8 && Math.random() < 0.7) this.spawnParticle(this.ppos.clone().setY(this.ppos.y + 0.9), this.colorA, 1, 0.3)
+      if (k >= 1 || this.body.grounded) {
+        this.flipT = -1
+        this.flipPivot.rotation.x = 0
+      }
+    }
     this.player.visible = !this.gameOver && (this.iframes <= 0 || this.action !== 'none' || Math.floor(this.time * 20) % 2 === 0)
     this.avatar?.update(dt, {
       speed: this.speedFactor,
@@ -2060,8 +2095,8 @@ export class GameEngine {
 
     // camera follow + shake
     const k = this.keys
-    if (k.has('q')) this.camYaw += rawDt * 2.4
-    if (k.has('e')) this.camYaw -= rawDt * 2.4
+    if (k.has('z')) this.camYaw += rawDt * 2.4
+    if (k.has('c') || k.has('e')) this.camYaw -= rawDt * 2.4
     this.camY += (this.ppos.y + 1.6 - this.camY) * (1 - Math.exp(-10 * rawDt))
     const camTarget = new THREE.Vector3(this.ppos.x, this.camY, this.ppos.z)
     const back = new THREE.Vector3(Math.sin(this.camYaw) * Math.cos(this.camPitch), Math.sin(this.camPitch), Math.cos(this.camYaw) * Math.cos(this.camPitch))
