@@ -130,6 +130,32 @@ const lim2S = pickAgent('S', 'Burnice White', [lim1S ?? ''])
 const lim1A = [pickAgent('A', 'Seth Lowell'), pickAgent('A', 'Soukaku')].filter((x): x is string => !!x)
 const lim2A = [pickAgent('A', 'Piper Wheel'), pickAgent('A', 'Ben Bigger')].filter((x): x is string => !!x)
 
+// ── dodatkowe banery: każdy S-agent ma własny limitowany baner, A-rangi rotują parami ──
+const BANNER_NAMES = [
+  'Signal Overload', 'Hollow Pulse', 'Midnight Static', 'Neon Requiem', 'Ether Bloom', 'Zero Hour',
+  'Ghost Frequency', 'Crimson Relay', 'Silent Ether', 'Glass Horizon', 'Feedback Loop', 'Wild Card',
+  'Dead Air', 'Afterglow', 'Overdrive', 'Static Bloom', 'Red Line', 'Cold Open', 'Full Volume',
+  'Low Orbit', 'Night Shift', 'Echo Chamber', 'Blue Hour', 'Wavelength', 'Chain Reaction',
+  'Last Call', 'Iron Lullaby', 'Paper Moon', 'High Voltage', 'Lost Channel', 'Prime Time',
+  'Burning Rubber', 'Black Box', 'Sky Dive', 'Moonlit Cipher', 'Undertow', 'Hard Reset',
+  'Velvet Thunder', 'Free Fall', 'Open Mic', 'Stray Signal', 'Daybreak', 'White Noise',
+  'Rogue Wave', 'Slow Burn', 'Encore', 'Sudden Death', 'Crossfade', 'Pale Fire', 'Hot Wire',
+]
+const usedS = new Set([lim1S, lim2S])
+const A_IDS = agentsOf('A').map((i) => i.id)
+const EXTRA_LIMITED: Banner[] = agentsOf('S')
+  .filter((i) => !usedS.has(i.id))
+  .map((it, k) => ({
+    id: `lim-x-${k}`,
+    kind: 'limited' as const,
+    name: BANNER_NAMES[k % BANNER_NAMES.length],
+    subtitle: 'Exclusive Channel',
+    featuredS: it.id,
+    featuredA: A_IDS.length ? [A_IDS[(k * 2) % A_IDS.length], A_IDS[(k * 2 + 1) % A_IDS.length]].filter((x, i, a) => a.indexOf(x) === i) : [],
+    standardS: STANDARD_S,
+    accent: it.element ? ELEMENT_COLORS[it.element][0] : '#7cffd4',
+  }))
+
 export const BANNERS: Banner[] = [
   {
     id: 'lim-1',
@@ -151,6 +177,7 @@ export const BANNERS: Banner[] = [
     standardS: STANDARD_S,
     accent: '#ff4d2e',
   },
+  ...EXTRA_LIMITED,
   {
     id: 'gear',
     kind: 'gear',
