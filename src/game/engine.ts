@@ -162,9 +162,16 @@ export interface EngineOptions {
   onHud: (h: HudState) => void
   /** ◈ zarobione za pokonanie wroga / falę — od razu trafia do zapisu gachy */
   onReward?: (amount: number) => void
+  /** urządzenie dotykowe: lżejszy rendering, kamera podąża za ruchem */
+  touch?: boolean
 }
 
 /** Nagrody w ◈ (waluta gachy) */
+const ZOOM_KEY = 'arena-cam-zoom'
+const ZOOM_MIN = 3.4
+const ZOOM_MAX = 7.6
+export const ZOOM_STEPS = [4.6, 5.9, 7.2]
+
 const KILL_REWARD: Record<EnemyKind, number> = { grunt: 10, spiker: 14, brute: 60 }
 const waveBonus = (wave: number) => 50 + wave * 25
 
@@ -276,6 +283,11 @@ export class GameEngine {
   // input
   private keys = new Set<string>()
   private stick = new THREE.Vector2()
+  private touch = false
+  private lastCamDrag = -10
+  private paused = false
+  /** odległość kamery (zoom) — kółko myszy / przycisk na telefonie, zapamiętywana */
+  private camZoom = 4.6
 
   // hud
   private hudT = 0
@@ -304,6 +316,9 @@ export class GameEngine {
     this.container = container
     this.onHud = opts.onHud
     this.onReward = opts.onReward
+    this.touch = !!opts.touch
+    const savedZoom = Number(localStorage.getItem(ZOOM_KEY))
+    this.camZoom = savedZoom >= ZOOM_MIN && savedZoom <= ZOOM_MAX ? savedZoom : this.touch ? 5.9 : 4.6
     const agent = opts.agent
     this.ranged = rangedWeaponFor(agent.name)
     this.style = styleFor(agent.name, this.ranged)
@@ -325,8 +340,10 @@ export class GameEngine {
     // renderer
     const w = container.clientWidth || window.innerWidth
     const h = container.clientHeight || window.innerHeight
-    this.renderer = new THREE.WebGLRenderer({ antialias: true })
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+    const dpr = window.devicePixelRatio || 1
+    // telefony: niższa rozdzielczość renderu i bez MSAA przy gęstych ekranach (wydajność / bateria)
+    this.renderer = new THREE.WebGLRenderer({ antialias: !this.touch || dpr < 2, powerPreference: 'high-performance' })
+    this.renderer.setPixelRatio(Math.min(dpr, this.touch ? 1.5 : 2))
     this.renderer.setSize(w, h)
     this.renderer.shadowMap.enabled = true
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
@@ -339,7 +356,7 @@ export class GameEngine {
     this.overlay.className = 'game-floaters'
     container.appendChild(this.overlay)
 
-    this.camera = new THREE.PerspectiveCamera(60, w / h, 0.1, 400)
+    this.camera = new THREE.PerspectiveCamera(this.fovFor(w / h), w / h, 0.1, 400)
     this.camera.position.set(0, 7.2, 8.6)
 
     this.buildArena()
@@ -369,7 +386,8 @@ export class GameEngine {
     s.add(amb)
     const sun = new THREE.DirectionalLight(0xfff0d6, 2.6)
     sun.castShadow = true
-    sun.shadow.mapSize.set(2048, 2048)
+    const sm = this.touch ? 1024 : 2048
+    sun.shadow.mapSize.set(sm, sm)
     sun.shadow.bias = -0.0005
     const sc = sun.shadow.camera
     sc.left = -22
@@ -477,6 +495,15 @@ export class GameEngine {
       else if (e.button === 2) this.trigger('special')
     })
     on(cv, 'contextmenu', (e) => e.preventDefault())
+    on(
+      cv,
+      'wheel',
+      (e) => {
+        e.preventDefault()
+        this.setZoom(this.camZoom * Math.exp(e.deltaY * 0.0015))
+      },
+      { passive: false },
+    )
     // TPP: rozglądanie myszą (pointer lock) i przeciąganiem palca
     on(window, 'mousemove', (e) => {
       if (document.pointerLockElement !== cv) return
@@ -497,6 +524,7 @@ export class GameEngine {
     on(cv, 'touchmove', (e) => {
       for (const t of Array.from(e.changedTouches))
         if (t.identifier === touchId) {
+          this.lastCamDrag = this.time
           this.camYaw -= (t.clientX - tx) * 0.006
           this.camPitch = THREE.MathUtils.clamp(this.camPitch + (t.clientY - ty) * 0.004, -0.15, 1.1)
           tx = t.clientX
@@ -515,13 +543,42 @@ export class GameEngine {
     this.cleanups.push(() => ro.disconnect())
   }
 
+  setZoom(d: number) {
+    this.camZoom = THREE.MathUtils.clamp(d, ZOOM_MIN, ZOOM_MAX)
+    localStorage.setItem(ZOOM_KEY, this.camZoom.toFixed(2))
+  }
+
+  /** przycisk na telefonie: blisko → średnio → daleko → blisko; zwraca indeks poziomu */
+  cycleZoom() {
+    const i = ZOOM_STEPS.findIndex((z) => z > this.camZoom + 0.05)
+    this.setZoom(ZOOM_STEPS[i < 0 ? 0 : i])
+    return this.zoomLevel()
+  }
+
+  zoomLevel() {
+    let best = 0
+    ZOOM_STEPS.forEach((z, i) => {
+      if (Math.abs(z - this.camZoom) < Math.abs(ZOOM_STEPS[best] - this.camZoom)) best = i
+    })
+    return best
+  }
+
+  /** pauza (np. telefon w pionie) — scena dalej się renderuje, logika stoi */
+  setPaused(p: boolean) {
+    this.paused = p
+    if (p) {
+      this.keys.clear()
+      this.stick.set(0, 0)
+    }
+  }
+
   /** Virtual joystick input (-1..1, y up = forward). */
   setStick(x: number, y: number) {
     this.stick.set(x, y)
   }
 
   trigger(a: GameAction) {
-    if (this.gameOver || this.loading) return
+    if (this.gameOver || this.loading || this.paused) return
     if (a === 'attack') {
       if (this.action === 'none') this.startLight()
       else if (this.action === 'light') this.queuedAttack = true
@@ -538,7 +595,13 @@ export class GameEngine {
     if (!w || !h) return
     this.renderer.setSize(w, h)
     this.camera.aspect = w / h
+    this.camera.fov = this.fovFor(w / h)
     this.camera.updateProjectionMatrix()
+  }
+
+  /** pion (telefon) → szersze pole widzenia, żeby widzieć wrogów po bokach */
+  private fovFor(aspect: number) {
+    return aspect < 1 ? 74 : aspect < 1.5 ? 66 : 60
   }
 
   // ───────────── player actions ─────────────
@@ -1933,6 +1996,10 @@ export class GameEngine {
     if (this.disposed) return
     this.raf = requestAnimationFrame(this.loop)
     const rawDt = Math.min(this.clock.getDelta(), 0.05)
+    if (this.paused) {
+      this.renderer.render(this.scene, this.camera)
+      return
+    }
     this.time += rawDt
     let dt = rawDt
     if (this.hitStop > 0) {
@@ -2097,11 +2164,13 @@ export class GameEngine {
     const k = this.keys
     if (k.has('z')) this.camYaw += rawDt * 2.4
     if (k.has('c') || k.has('e')) this.camYaw -= rawDt * 2.4
+    // dotyk: ruch joystickiem w bok powoli obraca kamerę (gdy gracz nie kręci nią palcem)
+    if (this.touch && this.time - this.lastCamDrag > 0.7 && !this.gameOver) this.camYaw -= this.stick.x * Math.min(1, this.stick.length()) * rawDt * 1.3
     this.camY += (this.ppos.y + 1.6 - this.camY) * (1 - Math.exp(-10 * rawDt))
     const camTarget = new THREE.Vector3(this.ppos.x, this.camY, this.ppos.z)
     const back = new THREE.Vector3(Math.sin(this.camYaw) * Math.cos(this.camPitch), Math.sin(this.camPitch), Math.cos(this.camYaw) * Math.cos(this.camPitch))
     // ramię kamery skraca się przy ścianach
-    const allowed = this.city.cameraDistance(camTarget, back, 4.6)
+    const allowed = this.city.cameraDistance(camTarget, back, this.camZoom)
     this.camDist = allowed < this.camDist ? allowed : this.camDist + (allowed - this.camDist) * (1 - Math.exp(-4 * rawDt))
     // lekko za prawym ramieniem
     const shoulder = new THREE.Vector3(-back.z, 0, back.x).normalize().multiplyScalar(-0.55 * Math.min(1, this.camDist / 3))
