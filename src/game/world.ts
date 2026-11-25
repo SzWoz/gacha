@@ -745,7 +745,7 @@ export function buildWorld(scene: THREE.Scene, accent: THREE.Color, level: numbe
         const j = cj(z)
         const floor = inMap(i, j) ? heights[id(i, j)] : 0
         if (y < floor + 0.3) return Math.max(0.6, d - 0.3)
-        if (wallAt(x + 0.3, z) || wallAt(x - 0.3, z) || wallAt(x, z + 0.3) || wallAt(x, z - 0.3)) return Math.max(0.6, d - 0.25)
+        if (wallAt(x + 0.5, z) || wallAt(x - 0.5, z) || wallAt(x, z + 0.5) || wallAt(x, z - 0.5)) return Math.max(0.6, d - 0.3)
       }
       return max
     },

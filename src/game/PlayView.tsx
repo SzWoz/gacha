@@ -3,6 +3,7 @@ import { useCallback, useState } from 'react'
 import { Portrait } from '../components/Portrait'
 import { ELEMENT_COLORS, ITEMS, RANK_COLOR, type Item } from '../data/roster'
 import { sfx } from '../lib/sfx'
+import { enterLandscape, isTouch } from './device'
 import { Game } from './Game'
 
 /** "play" tab: pick an owned agent, then drop into the arena. */
@@ -14,6 +15,7 @@ export function PlayView({ owned, onInGame, onReward }: { owned: Record<string, 
 
   const start = (a: Item) => {
     sfx.click()
+    if (isTouch()) void enterLandscape()
     setAgent(a)
     onInGame(true)
   }
