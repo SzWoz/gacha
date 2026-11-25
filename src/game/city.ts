@@ -1,38 +1,175 @@
 import * as THREE from 'three'
 
 // ─────────────────────────────────────────────────────────────
-//  Post-apo miasto za dnia: korytarze ulic między zrujnowanymi,
-//  zarośniętymi budynkami, małe place jako areny. Mapa z ASCII:
+//  Post-apo miasto za dnia: ulice i place między zrujnowanymi,
+//  zarośniętymi budynkami. Mapa generowana proceduralnie co poziom:
 //    '#' budynek (ściana)   '.' ulica   'P' plac   'S' start
+//    'B' arena bossa         'H' apteczka
+//  Wszystkie drogi (drzewo połączeń) prowadzą do areny bossa.
 //  Wrogowie chodzą po siatce (flow field z BFS od gracza).
 // ─────────────────────────────────────────────────────────────
 
-const MAP = `
-##################
-#S.....#.......PP#
-#.####.#.#####.PP#
-#.#....#.....#...#
-#.#.#######..#.###
-#...#PPP..#..#...#
-###.#PPP..#.####.#
-#...#.....#......#
-#.###.##.###.###.#
-#.....#.....#..#.#
-#.#####.#P#.#..#.#
-#.#...#.#.#.##.#.#
-#...#.....#....#.#
-##.##.#.#####.##.#
-#PP...#.......#..#
-#PP.###.#####...##
-#.......#PPP.....#
-##################`
-  .trim()
-  .split('\n')
-
+let MAP: string[] = []
 export const CELL = 6
-const GW = MAP[0].length
-const GH = MAP.length
-export const CITY_HALF = (GW * CELL) / 2
+let GW = 0
+let GH = 0
+/** połowa boku mapy w metrach — zmienia się razem z mapą (live binding) */
+export let CITY_HALF = 0
+
+/** Generuje nową, otwartą mapę: place połączone szerokimi ulicami, drzewo dróg zbiega się w arenie bossa. */
+export function generateMap(level: number, seed: number): string[] {
+  const rng = rngFrom(seed)
+  const ri = (a: number, b: number) => a + Math.floor(rng() * (b - a + 1))
+  const N = 21 + 2 * Math.min(level - 1, 3)
+  const g: string[][] = Array.from({ length: N }, () => Array(N).fill('#'))
+  const inside = (i: number, j: number) => i > 0 && j > 0 && i < N - 1 && j < N - 1
+  const set = (i: number, j: number, c: string, over = false) => {
+    if (!inside(i, j)) return
+    if (over || g[j][i] === '#') g[j][i] = c
+  }
+
+  // arena bossa (5×5) w losowej ćwiartce, z dala od środka
+  const BS = 5
+  const qx = rng() < 0.5
+  const qz = rng() < 0.5
+  const bx = qx ? ri(2, 4) : N - 2 - BS - ri(0, 2)
+  const bz = qz ? ri(2, 4) : N - 2 - BS - ri(0, 2)
+  for (let j = bz; j < bz + BS; j++) for (let i = bx; i < bx + BS; i++) g[j][i] = 'B'
+  const bossC: [number, number] = [bx + 2, bz + 2]
+  const nearBoss = (i: number, j: number) => i >= bx - 1 && i <= bx + BS && j >= bz - 1 && j <= bz + BS
+
+  // place (mogą na siebie zachodzić → nieregularne, otwarte przestrzenie)
+  const rooms: [number, number][] = []
+  const want = Math.min(14, 10 + level)
+  for (let tries = 0; tries < 600 && rooms.length < want; tries++) {
+    const w = ri(2, 4)
+    const h = ri(2, 4)
+    const x = ri(1, N - 1 - w)
+    const z = ri(1, N - 1 - h)
+    let bad = false
+    for (let j = z - 1; j <= z + h && !bad; j++) for (let i = x - 1; i <= x + w && !bad; i++) if (nearBoss(i, j)) bad = true
+    if (bad) continue
+    const c: [number, number] = [x + (w >> 1), z + (h >> 1)]
+    if (rooms.some(([a, b]) => Math.abs(a - c[0]) + Math.abs(b - c[1]) < 4)) continue
+    for (let j = z; j < z + h; j++) for (let i = x; i < x + w; i++) set(i, j, 'P')
+    rooms.push(c)
+  }
+
+  // ulica w kształcie L (szerokość 1–2) między dwoma punktami
+  const road = (a: [number, number], b: [number, number], wide: boolean) => {
+    let [i, j] = a
+    const hFirst = rng() < 0.5
+    const step = (axis: 'x' | 'z') => {
+      if (axis === 'x') while (i !== b[0]) {
+        set(i, j, '.')
+        if (wide) set(i, j + 1, '.')
+        i += Math.sign(b[0] - i)
+      }
+      else while (j !== b[1]) {
+        set(i, j, '.')
+        if (wide) set(i + 1, j, '.')
+        j += Math.sign(b[1] - j)
+      }
+    }
+    step(hFirst ? 'x' : 'z')
+    step(hFirst ? 'z' : 'x')
+    set(i, j, '.')
+  }
+
+  // drzewo dróg zakorzenione w arenie: każdy plac łączy się z najbliższym już połączonym
+  // węzłem, który leży bliżej bossa → idąc „w górę” drzewa zawsze dojdziesz do areny
+  const md = (a: [number, number], b: [number, number]) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1])
+  const connected: [number, number][] = [bossC]
+  const order = [...rooms].sort((a, b) => md(a, bossC) - md(b, bossC))
+  for (const r of order) {
+    let best = connected[0]
+    for (const c of connected) if (md(c, r) < md(best, r)) best = c
+    road(r, best, rng() < 0.8)
+    connected.push(r)
+  }
+  // kilka dodatkowych przejść (pętle) — mniej ślepych zaułków
+  for (let k = 0; k < 2 + (level >> 1); k++) {
+    const a = rooms[Math.floor(rng() * rooms.length)]
+    const b = rooms[Math.floor(rng() * rooms.length)]
+    if (a && b && a !== b) road(a, b, false)
+  }
+
+  // otwieranie: cienkie ściany między przestrzeniami zamieniamy w gruzowiska/ulice
+  const open = (i: number, j: number) => inside(i, j) && g[j][i] !== '#'
+  for (let pass = 0; pass < 2; pass++) {
+    const kill: [number, number][] = []
+    for (let j = 1; j < N - 1; j++)
+      for (let i = 1; i < N - 1; i++) {
+        if (g[j][i] !== '#' || nearBoss(i, j)) continue
+        let n = 0
+        for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) if ((di || dj) && open(i + di, j + dj)) n++
+        const thin = (open(i - 1, j) && open(i + 1, j)) || (open(i, j - 1) && open(i, j + 1))
+        if (n >= 6 || (thin && rng() < 0.35) || (n >= 4 && rng() < 0.18)) kill.push([i, j])
+      }
+    for (const [i, j] of kill) g[j][i] = '.'
+  }
+
+  // spójność: zostawiamy tylko to, co osiągalne z areny
+  const flood = (from: [number, number]) => {
+    const d = new Int32Array(N * N).fill(-1)
+    const q = [from[1] * N + from[0]]
+    d[q[0]] = 0
+    for (let h = 0; h < q.length; h++) {
+      const c = q[h]
+      const i = c % N
+      const j = (c / N) | 0
+      for (const [di, dj] of [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ]) {
+        const ni = i + di
+        const nj = j + dj
+        if (!open(ni, nj) || d[nj * N + ni] >= 0) continue
+        d[nj * N + ni] = d[c] + 1
+        q.push(nj * N + ni)
+      }
+    }
+    return d
+  }
+  const dB = flood(bossC)
+  const cells: [number, number, number][] = []
+  for (let j = 1; j < N - 1; j++)
+    for (let i = 1; i < N - 1; i++) {
+      if (g[j][i] === '#') continue
+      if (dB[j * N + i] < 0) g[j][i] = '#'
+      else if (g[j][i] !== 'B') cells.push([i, j, dB[j * N + i]])
+    }
+
+  // start: jedno z najdalszych od areny miejsc
+  cells.sort((a, b) => b[2] - a[2])
+  const far = cells.slice(0, Math.max(1, Math.floor(cells.length * 0.08)))
+  const [si, sj] = far[Math.floor(rng() * far.length)]
+  g[sj][si] = 'S'
+  const maxD = cells[0][2]
+
+  // apteczki: rozrzucone po drodze (na placach jeśli się da) + jedna przed areną
+  const heals: [number, number][] = []
+  const tryHeal = (pool: [number, number, number][]) => {
+    for (let t = 0; t < 40 && pool.length; t++) {
+      const [i, j] = pool[Math.floor(rng() * pool.length)]
+      if (g[j][i] === 'S' || g[j][i] === 'H') continue
+      if (heals.some(([a, b]) => Math.abs(a - i) + Math.abs(b - j) < 5)) continue
+      if (Math.abs(i - si) + Math.abs(j - sj) < 3) continue
+      g[j][i] = 'H'
+      heals.push([i, j])
+      return
+    }
+  }
+  const mid = cells.filter(([, , d]) => d > 4 && d < maxD - 2)
+  const midPlaza = mid.filter(([i, j]) => g[j][i] === 'P')
+  const nHeals = 3 + Math.min(2, level >> 1)
+  for (let k = 0; k < nHeals; k++) tryHeal(midPlaza.length > k * 2 ? midPlaza : mid)
+  tryHeal(cells.filter(([, , d]) => d >= 2 && d <= 4))
+
+  return g.map((r) => r.join(''))
+}
 
 export interface Box {
   minX: number
@@ -45,13 +182,21 @@ export interface City {
   boxes: Box[]
   start: THREE.Vector3
   spawnPoint(from: THREE.Vector3, min: number, max: number): THREE.Vector3
+  /** losowy punkt na ulicy/placu (poza areną bossa), co najmniej `minDist` od `avoid` */
+  randomPoint(avoid: THREE.Vector3, minDist: number): THREE.Vector3
+  /** środek areny bossa */
+  bossCenter: THREE.Vector3
+  /** czy punkt leży w arenie bossa */
+  inBossRoom(p: THREE.Vector3): boolean
+  /** miejsca apteczek */
+  heals: THREE.Vector3[]
   /** kierunek ruchu wroga do celu (omija ściany) */
   steer(from: THREE.Vector3, out: THREE.Vector3): THREE.Vector3
   /** jak daleko kamera może odjechać od `target` w kierunku `dir`, zanim wejdzie w ścianę */
   cameraDistance(target: THREE.Vector3, dir: THREE.Vector3, max: number): number
   wallAt(x: number, z: number): boolean
   update(time: number, dt: number, player: THREE.Vector3, camera: THREE.Vector3): void
-  drawMinimap(ctx: CanvasRenderingContext2D, size: number, player: THREE.Vector3, facing: number, enemies: THREE.Vector3[], camYaw?: number): void
+  drawMinimap(ctx: CanvasRenderingContext2D, size: number, player: THREE.Vector3, facing: number, enemies: THREE.Vector3[], camYaw?: number, pickups?: THREE.Vector3[]): void
   dispose(): void
 }
 
@@ -246,8 +391,12 @@ function addWind(mat: THREE.Material, uTime: { value: number }, strength: number
 
 // ── budowa ──────────────────────────────────────────────────
 
-export function buildCity(scene: THREE.Scene, accent: THREE.Color): City {
-  const rng = rngFrom(2077)
+export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, seed = 2077): City {
+  MAP = generateMap(level, seed)
+  GW = MAP[0].length
+  GH = MAP.length
+  CITY_HALF = (GW * CELL) / 2
+  const rng = rngFrom(seed ^ 0x5bd1e995)
   const disposables: { dispose(): void }[] = []
   const group = new THREE.Group()
   scene.add(group)
@@ -255,12 +404,19 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color): City {
   const boxes: Box[] = []
   const walk: [number, number][] = []
   let start = new THREE.Vector3()
+  const heals: THREE.Vector3[] = []
+  const bossCells: [number, number][] = []
   for (let j = 0; j < GH; j++)
     for (let i = 0; i < GW; i++) {
       if (MAP[j][i] === '#') boxes.push({ minX: cx(i) - CELL / 2, maxX: cx(i) + CELL / 2, minZ: cz(j) - CELL / 2, maxZ: cz(j) + CELL / 2 })
       else walk.push([i, j])
       if (MAP[j][i] === 'S') start = new THREE.Vector3(cx(i), 0, cz(j))
+      if (MAP[j][i] === 'H') heals.push(new THREE.Vector3(cx(i), 0, cz(j)))
+      if (MAP[j][i] === 'B') bossCells.push([i, j])
     }
+  const bossCenter = new THREE.Vector3()
+  for (const [i, j] of bossCells) bossCenter.add(new THREE.Vector3(cx(i), 0, cz(j)))
+  bossCenter.divideScalar(Math.max(1, bossCells.length))
   const T = <X extends { dispose(): void }>(x: X) => (disposables.push(x), x)
 
   // ── niebo z chmurami + słońce ────────────────────────────
@@ -385,6 +541,13 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color): City {
     return m
   }
 
+  /** odległość (Czebyszew, max 3) do najbliższej komórki chodnika */
+  const openWithin = (i: number, j: number) => {
+    for (let r = 1; r <= 2; r++)
+      for (let dj = -r; dj <= r; dj++)
+        for (let di = -r; di <= r; di++) if (!wall(i + di, j + dj) && i + di >= 0 && j + dj >= 0 && i + di < GW && j + dj < GH) return r
+    return 3
+  }
   const ivyGeo = T(new THREE.PlaneGeometry(2.2, 1))
   ivyGeo.translate(0, -0.5, 0) // zaczepione u góry, zwisa w dół
   for (let j = 0; j < GH; j++)
@@ -392,8 +555,16 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color): City {
       if (!wall(i, j)) continue
       const x = cx(i)
       const z = cz(j)
-      const border = i === 0 || j === 0 || i === GW - 1 || j === GH - 1
+      // głębokie wnętrze kwartału: niewidoczne z ulicy — pełny budynek tylko przy ulicy,
+      // drugi rząd jako prosta bryła (linia dachów), dalej nic
+      const depth = openWithin(i, j)
+      if (depth > 2) continue
       const mat = facadeMats[Math.floor(rng() * facadeMats.length)]
+      if (depth === 2) {
+        box(CELL, 14 + rng() * 14, CELL, mat, x, 0, z).castShadow = false
+        continue
+      }
+      const border = i === 0 || j === 0 || i === GW - 1 || j === GH - 1
       const H = border ? 12 + rng() * 14 : 6 + rng() * 13
       const solid = H * (0.55 + rng() * 0.25)
       box(CELL, solid, CELL, mat, x, 0, z)
@@ -848,6 +1019,15 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color): City {
     boxes,
     start,
     wallAt,
+    bossCenter,
+    heals,
+    inBossRoom: (p) => MAP[cj(p.z)]?.[ci(p.x)] === 'B',
+    randomPoint(avoid, minDist) {
+      const pool = walk.filter(([i, j]) => MAP[j][i] !== 'B' && Math.hypot(cx(i) - avoid.x, cz(j) - avoid.z) >= minDist)
+      const src = pool.length ? pool : walk
+      const [i, j] = src[Math.floor(Math.random() * src.length)]
+      return new THREE.Vector3(cx(i) + (Math.random() - 0.5) * (CELL - 2), 0, cz(j) + (Math.random() - 0.5) * (CELL - 2))
+    },
     spawnPoint(from, min, max) {
       const pi = ci(from.x)
       const pj = cj(from.z)
@@ -1028,7 +1208,7 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color): City {
         ga.needsUpdate = true
       }
     },
-    drawMinimap(ctx, size, player, facing, enemies, camYaw = 0) {
+    drawMinimap(ctx, size, player, facing, enemies, camYaw = 0, pickups = []) {
       const R = 30
       const s = size / (R * 2)
       ctx.clearRect(0, 0, size, size)
@@ -1047,9 +1227,15 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color): City {
       for (let j = 0; j < GH; j++)
         for (let i = 0; i < GW; i++) {
           const c = MAP[j][i]
-          ctx.fillStyle = c === '#' ? 'rgba(150,140,120,0.75)' : c === 'P' ? 'rgba(110,150,70,0.5)' : 'rgba(255,255,255,0.08)'
+          ctx.fillStyle = c === '#' ? 'rgba(150,140,120,0.75)' : c === 'P' ? 'rgba(110,150,70,0.5)' : c === 'B' ? 'rgba(255,62,90,0.35)' : 'rgba(255,255,255,0.08)'
           ctx.fillRect(tx(cx(i) - CELL / 2), tz(cz(j) - CELL / 2), CELL * s + 0.5, CELL * s + 0.5)
         }
+      ctx.fillStyle = '#5dff8a'
+      for (const h of pickups) {
+        ctx.beginPath()
+        ctx.arc(tx(h.x), tz(h.z), 3.5, 0, Math.PI * 2)
+        ctx.fill()
+      }
       ctx.fillStyle = '#ff3e5a'
       for (const e of enemies) {
         ctx.beginPath()

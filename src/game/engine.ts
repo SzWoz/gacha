@@ -24,6 +24,8 @@ const DODGE_DUR = 0.22
 const DODGE_SPEED = 19
 const DODGE_IFRAMES = 0.35
 const DODGE_CD = 0.8
+/** zasięg, w którym czekający wróg zauważa gracza */
+const AGGRO = 17
 
 const ENEMY: Record<EnemyKind, { hp: number; speed: number; r: number; dmg: number; reach: number; windup: number; score: number; color: number }> = {
   grunt: { hp: 30, speed: 3.2, r: 0.5, dmg: 8, reach: 1.5, windup: 0.6, score: 100, color: 0xff3e5a },
@@ -50,6 +52,8 @@ export interface HudState {
   banner: string | null
   /** nazwa superumiejętności (zależy od broni) */
   superName: string
+  level: number
+  boss: { hp: number; max: number } | null
 }
 
 export type GameAction = 'attack' | 'special' | 'dodge'
@@ -63,7 +67,9 @@ interface Enemy {
   vel: THREE.Vector3 // knockback velocity
   hp: number
   maxHp: number
-  state: 'spawn' | 'chase' | 'windup' | 'strike' | 'recover'
+  state: 'spawn' | 'idle' | 'chase' | 'windup' | 'strike' | 'recover'
+  reach: number
+  boss: boolean
   t: number
   flash: number
   dmg: number
@@ -200,6 +206,9 @@ export class GameEngine {
   private onReward?: (amount: number) => void
   private earned = 0
   private city!: City
+  private level = 1
+  private healMeshes: THREE.Mesh[] = []
+  private healGeo?: { bar: THREE.BoxGeometry; beam: THREE.CylinderGeometry }
   private minimap!: HTMLCanvasElement
   private minimapT = 0
 
@@ -260,6 +269,8 @@ export class GameEngine {
     this.disposables.push(this.ringMat, ...Object.values(this.geo))
 
     this.bindInput()
+    // DEV: dostęp z konsoli do testów (window.__game)
+    if (import.meta.env.DEV) (window as unknown as { __game?: GameEngine }).__game = this
     void this.loadAvatar(agent)
     this.startWave()
     this.clock.start()
@@ -294,8 +305,9 @@ export class GameEngine {
     this.player.add(rim)
 
     // miasto: ulice, budynki, plac, latarnie, auta
-    this.city = buildCity(s, this.colorA)
+    this.city = buildCity(s, this.colorA, this.level, (Math.random() * 1e9) | 0)
     this.ppos.copy(this.city.start)
+    this.placeHeals()
 
     // minimapa
     this.minimap = document.createElement('canvas')
@@ -1007,13 +1019,26 @@ export class GameEngine {
     }
   }
 
+  private aggro(e: Enemy) {
+    if (e.state !== 'idle') return
+    e.state = 'chase'
+    if (e.boss) {
+      this.showBanner('BOSS')
+      this.shake = Math.max(this.shake, 0.6)
+      this.spawnBurst(e.pos, 6, new THREE.Color(ENEMY[e.kind].color))
+    }
+    // budzi sąsiadów
+    for (const o of this.enemies) if (!o.dead && !o.boss && o.state === 'idle' && o.pos.distanceTo(e.pos) < 10) this.aggro(o)
+  }
+
   private damageEnemy(e: Enemy, dmg: number, knock: number, crit: boolean) {
+    this.aggro(e)
     e.hp -= dmg
     e.flash = 0.12
     const dir = e.pos.clone().sub(this.ppos).setY(0)
     if (dir.lengthSq() < 1e-4) dir.set(Math.sin(this.facing), 0, Math.cos(this.facing))
     dir.normalize()
-    const mass = e.kind === 'brute' ? 0.35 : 1
+    const mass = e.boss ? 0.1 : e.kind === 'brute' ? 0.35 : 1
     e.vel.addScaledVector(dir, knock * mass)
     if (e.state === 'windup' && e.kind !== 'brute') {
       e.state = 'recover' // interrupt
@@ -1036,6 +1061,7 @@ export class GameEngine {
     this.scene.remove(e.mesh)
     e.rig.dispose()
     ;(e.ring.material as THREE.Material).dispose()
+    if (e.boss) this.showBanner('BOSS POKONANY')
     if (e.kind === 'brute') {
       this.shake = 0.5
       this.hitStop = 0.15
@@ -1073,8 +1099,72 @@ export class GameEngine {
     this.floatText(at, `+${amount} ◈`, 'coin')
   }
 
+  private placeHeals() {
+    for (const m of this.healMeshes) {
+      this.scene.remove(m)
+      m.traverse((o) => {
+        const mm = o as THREE.Mesh
+        if (mm.isMesh) (mm.material as THREE.Material).dispose()
+      })
+    }
+    // apteczka: zielony krzyż + słup światła widoczny z daleka
+    if (!this.healGeo) {
+      this.healGeo = {
+        bar: new THREE.BoxGeometry(0.8, 0.26, 0.26),
+        beam: new THREE.CylinderGeometry(0.5, 0.9, 7, 16, 1, true).translate(0, 3.5, 0),
+      }
+      this.disposables.push(this.healGeo.bar, this.healGeo.beam)
+    }
+    const g = this.healGeo
+    this.healMeshes = this.city.heals.map((p) => {
+      const root = new THREE.Mesh()
+      const crossMat = new THREE.MeshBasicMaterial({ color: 0x5dff8a })
+      const cross = new THREE.Group()
+      const h = new THREE.Mesh(g.bar, crossMat)
+      const v = new THREE.Mesh(g.bar, crossMat)
+      v.rotation.z = Math.PI / 2
+      cross.add(h, v)
+      cross.position.y = 1
+      cross.name = 'cross'
+      const beam = new THREE.Mesh(g.beam, new THREE.MeshBasicMaterial({ color: 0x5dff8a, transparent: true, opacity: 0.16, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }))
+      root.add(cross, beam)
+      root.position.copy(p)
+      this.scene.add(root)
+      return root
+    })
+  }
+
+  private updateHeals(dt: number) {
+    for (const m of this.healMeshes) {
+      if (!m.visible) continue
+      const cross = m.getObjectByName('cross')!
+      cross.position.y = 1 + Math.sin(this.time * 3 + m.position.x) * 0.15
+      cross.rotation.y += dt * 2
+      const dx = this.ppos.x - m.position.x
+      const dz = this.ppos.z - m.position.z
+      if (this.hp < this.maxHp && dx * dx + dz * dz < 1.4 * 1.4) {
+        m.visible = false
+        const amt = Math.round(this.maxHp * 0.35)
+        this.hp = Math.min(this.maxHp, this.hp + amt)
+        this.floatText(this.ppos.clone().setY(2.4), `+${amt}`, 'heal')
+        for (let i = 0; i < 16; i++) this.spawnParticle(m.position.clone().setY(1), new THREE.Color(0x5dff8a), 4, 0.6, true)
+      }
+    }
+  }
+
+  /** nowa, wygenerowana mapa (następny poziom) */
+  private newLevel(level: number) {
+    this.level = level
+    this.city.dispose()
+    this.city = buildCity(this.scene, this.colorA, level, (Math.random() * 1e9) | 0)
+    this.ppos.copy(this.city.start)
+    this.placeHeals()
+  }
+
   private startWave() {
     if (this.wave > 0) this.reward(waveBonus(this.wave), this.ppos.clone().setY(2.8))
+    // co 3 fale (po pokonaniu bossa) — nowa mapa
+    if (this.wave > 0 && this.wave % 3 === 0) this.newLevel(this.level + 1)
     this.wave++
     const n = this.wave
     const list: EnemyKind[] = []
@@ -1083,7 +1173,9 @@ export class GameEngine {
     if (n % 3 === 0) for (let i = 0; i < Math.floor(n / 3); i++) list.splice(Math.floor(list.length / 2), 0, 'brute')
     this.toSpawn = list
     this.spawnTimer = 0.4
-    this.showBanner(n % 3 === 0 ? `FALA ${n} · BOSS` : `FALA ${n}`)
+    const w = ((n - 1) % 3) + 1
+    const lvl = w === 1 && n > 1 ? `POZIOM ${this.level} · ` : ''
+    this.showBanner(n % 3 === 0 ? `FALA ${w} · BOSS CZEKA W ARENIE` : `${lvl}FALA ${w}`)
   }
 
   private showBanner(text: string) {
@@ -1096,7 +1188,9 @@ export class GameEngine {
     const cfg = ENEMY[kind]
     const scale = 1 + (this.wave - 1) * 0.12
     // spawn na ulicy w pobliżu gracza (poza ekranem, ale niedaleko)
-    const pos = this.city.spawnPoint(this.ppos, 12, 26)
+    // losowe miejsce na mapie; boss czeka w swojej arenie
+    const boss = kind === 'brute' && this.wave % 3 === 0 && !this.enemies.some((x) => x.boss && !x.dead)
+    const pos = boss ? this.city.bossCenter.clone() : this.city.randomPoint(this.ppos, 16)
     const rig = createEnemyRig(kind, cfg.color)
     const mesh = new THREE.Group()
     mesh.add(rig.root)
@@ -1107,7 +1201,7 @@ export class GameEngine {
     mesh.add(ring)
     mesh.position.copy(pos)
     this.scene.add(mesh)
-    const hp = Math.round(cfg.hp * scale)
+    const hp = Math.round(cfg.hp * scale * (boss ? 3 + this.level : 1))
     const e: Enemy = {
       kind,
       mesh,
@@ -1120,13 +1214,16 @@ export class GameEngine {
       state: 'spawn',
       t: 0.7,
       flash: 0,
-      dmg: Math.round(cfg.dmg * (1 + (this.wave - 1) * 0.08)),
+      dmg: Math.round(cfg.dmg * (1 + (this.wave - 1) * 0.08) * (boss ? 1.3 : 1)),
       speed: cfg.speed * (0.9 + Math.random() * 0.2) * Math.min(1.35, 1 + (this.wave - 1) * 0.03),
-      r: cfg.r,
+      r: cfg.r * (boss ? 1.6 : 1),
+      reach: cfg.reach * (boss ? 1.5 : 1),
+      boss,
       dead: false,
       seed: Math.random() * 100,
     }
     // spawn column vfx
+    if (boss) rig.root.scale.multiplyScalar(1.6)
     for (let i = 0; i < 10; i++) this.spawnParticle(pos.clone().setY(0.2), new THREE.Color(cfg.color), 3, 0.6, true)
     this.enemies.push(e)
   }
@@ -1141,7 +1238,14 @@ export class GameEngine {
       e.t -= dt
       switch (e.state) {
         case 'spawn': {
-          if (e.t <= 0) e.state = 'chase'
+          if (e.t <= 0) e.state = 'idle'
+          break
+        }
+        case 'idle': {
+          // czeka w swoim miejscu, aż gracz podejdzie (boss — aż wejdzie do areny)
+          e.mesh.rotation.y += Math.sin(this.time * 0.7 + e.seed) * dt * 0.6
+          const wake = e.boss ? this.city.inBossRoom(this.ppos) || dist < 9 : dist < AGGRO
+          if (wake && !this.gameOver) this.aggro(e)
           break
         }
         case 'chase': {
@@ -1150,7 +1254,7 @@ export class GameEngine {
             e.pos.addScaledVector(desired, e.speed * dt)
             e.mesh.rotation.y = Math.atan2(desired.x, desired.z)
           }
-          if (dist < cfg.reach + PLAYER_R && !this.gameOver) {
+          if (dist < e.reach + PLAYER_R && !this.gameOver) {
             e.state = 'windup'
             e.t = cfg.windup
             e.ring.visible = true
@@ -1159,7 +1263,7 @@ export class GameEngine {
         }
         case 'windup': {
           const k = 1 - e.t / cfg.windup
-          const rr = cfg.reach + 0.2
+          const rr = e.reach + 0.2
           e.ring.scale.setScalar(rr * (0.3 + 0.7 * k))
           ;(e.ring.material as THREE.MeshBasicMaterial).opacity = 0.3 + 0.5 * k
           e.mesh.rotation.y = Math.atan2(toP.x, toP.z)
@@ -1169,10 +1273,10 @@ export class GameEngine {
             e.ring.visible = false
             // lunge
             if (dist > 0.01) e.vel.addScaledVector(toP.clone().divideScalar(dist), e.kind === 'brute' ? 5 : 8)
-            if (dist < cfg.reach + PLAYER_R + 0.3) this.hurtPlayer(e.dmg, e.pos)
+            if (dist < e.reach + PLAYER_R + 0.3) this.hurtPlayer(e.dmg, e.pos)
             if (e.kind === 'brute') {
               this.shake = Math.max(this.shake, 0.45)
-              this.spawnBurst(e.pos, cfg.reach, new THREE.Color(cfg.color))
+              this.spawnBurst(e.pos, e.reach, new THREE.Color(cfg.color))
             }
           }
           break
@@ -1197,7 +1301,7 @@ export class GameEngine {
       const recoverDur = e.kind === 'brute' ? 0.9 : 0.6
       const stateDur = e.state === 'spawn' ? 0.7 : e.state === 'windup' ? cfg.windup : e.state === 'strike' ? 0.15 : e.state === 'recover' ? recoverDur : 1
       e.rig.update(dt, {
-        state: e.state,
+        state: e.state === 'idle' ? 'chase' : e.state,
         k: Math.min(1, Math.max(0, 1 - e.t / stateDur)),
         moving: e.state === 'chase' && dist > 0.3,
         time: this.time + e.seed,
@@ -1486,6 +1590,7 @@ export class GameEngine {
       }
     }
     this.updateEnemies(dt)
+    this.updateHeals(dt)
     this.updateProjectiles(dt)
     this.updateVfx(dt)
 
@@ -1525,7 +1630,7 @@ export class GameEngine {
     if (this.minimapT <= 0) {
       this.minimapT = 0.1
       const mctx = this.minimap.getContext('2d')
-      if (mctx) this.city.drawMinimap(mctx, this.minimap.width, this.ppos, this.facing, this.enemies.map((e) => e.pos), this.camYaw)
+      if (mctx) this.city.drawMinimap(mctx, this.minimap.width, this.ppos, this.facing, this.enemies.map((e) => e.pos), this.camYaw, this.healMeshes.filter((m) => m.visible).map((m) => m.position))
     }
     this.dust.rotation.y += rawDt * 0.01
     for (const s of this.spinners) s.rotation.y += rawDt * 1.5
@@ -1554,6 +1659,11 @@ export class GameEngine {
       gameOver: this.gameOver,
       banner: this.banner,
       superName: this.spec.superName,
+      level: this.level,
+      boss: (() => {
+        const b = this.enemies.find((e) => e.boss && !e.dead && e.state !== 'idle' && e.state !== 'spawn')
+        return b ? { hp: Math.max(0, b.hp), max: b.maxHp } : null
+      })(),
     })
   }
 
@@ -1579,6 +1689,7 @@ export class GameEngine {
     this.dodgeCd = 0
     this.iframes = 1
     this.wave = 0
+    this.newLevel(1)
     this.kills = 0
     this.score = 0
     this.waveDelay = 1.2

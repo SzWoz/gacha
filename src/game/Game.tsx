@@ -67,7 +67,10 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
           </div>
         </div>
         <div className="hud-right">
-          <div className="hud-wave">FALA {hud?.wave ?? 1}</div>
+          <div className="hud-wave">POZIOM {hud?.level ?? 1}</div>
+          <div className="hud-stat">
+            Fala <b>{(((hud?.wave ?? 1) - 1) % 3) + 1}/3</b>
+          </div>
           <div className="hud-stat">
             Pokonani <b>{hud?.kills ?? 0}</b>
           </div>
@@ -99,6 +102,13 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
         )}
       </div>
 
+      {hud?.boss && !hud.gameOver && (
+        <div className="boss-bar">
+          <span>BOSS</span>
+          <i style={{ width: `${(hud.boss.hp / hud.boss.max) * 100}%` }} />
+        </div>
+      )}
+
       {hud?.banner && !hud.gameOver && (
         <div key={hud.banner} className="game-banner">
           {hud.banner}
@@ -111,7 +121,7 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
         <div className="game-over">
           <h2>KONIEC GRY</h2>
           <p>
-            Fala <b>{hud.wave}</b> · Pokonani <b>{hud.kills}</b> · Wynik <b>{hud.score.toLocaleString()}</b>
+            Poziom <b>{hud.level}</b> · Fala <b>{hud.wave}</b> · Pokonani <b>{hud.kills}</b> · Wynik <b>{hud.score.toLocaleString()}</b>
           </p>
           <div className="game-over-btns">
             <button className="btn-g primary" onClick={() => engine.current?.restart()}>

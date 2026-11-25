@@ -406,6 +406,12 @@ table.history { width: 100%; border-collapse: collapse; background: rgba(7,6,13,
 .game-help b { color: var(--fg); padding: 1px 5px; border: 1px solid rgba(255,255,255,.25); margin-right: 2px; }
 .game-model-tag { position: absolute; left: 18px; bottom: 14px; font-size: 10px; color: var(--muted); letter-spacing: .08em; max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.boss-bar {
+  position: absolute; top: 18px; left: 50%; transform: translateX(-50%); width: min(520px, 70vw); height: 14px;
+  border: 1px solid rgba(255,62,90,.7); background: rgba(20,4,8,.6); z-index: 6; pointer-events: none;
+}
+.boss-bar i { display: block; height: 100%; background: linear-gradient(90deg, #ff3e5a, #ff9a3e); transition: width .15s; }
+.boss-bar span { position: absolute; top: -18px; left: 0; font-family: var(--display); font-size: 13px; letter-spacing: .2em; color: #ff3e5a; }
 .game-banner {
   position: absolute; left: 50%; top: 22%; translate: -50% 0; pointer-events: none;
   font-family: var(--display); font-size: clamp(40px, 8vw, 84px); letter-spacing: .1em; color: #fff;
