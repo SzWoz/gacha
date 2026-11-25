@@ -59,15 +59,20 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
               <b>K</b>
               <small title={hud?.superName}>{hud && hud.special > 0 ? hud.special.toFixed(1) : 'SUPER'}</small>
             </div>
-            <div className={`hud-cd ${hud && hud.dodge <= 0 ? 'ready' : ''}`}>
-              <i style={{ height: `${hud ? (1 - hud.dodge / 0.8) * 100 : 100}%` }} />
-              <b>␣</b>
-              <small>UNIK</small>
+            <div className={`hud-cd ${hud && hud.dodge > 0 ? 'ready' : ''} ${hud?.counter ? 'counter' : ''}`}>
+              <i style={{ height: `${hud ? hud.dodgeT * 100 : 100}%` }} />
+              <b className="pips">
+                {Array.from({ length: hud?.dodgeMax ?? 2 }, (_, k) => (
+                  <em key={k} className={hud && k < hud.dodge ? 'on' : ''} />
+                ))}
+              </b>
+              <small>{hud?.counter ? 'KONTRA' : 'UNIK Q'}</small>
             </div>
           </div>
         </div>
         <div className="hud-right">
           <div className="hud-wave">POZIOM {hud?.level ?? 1}</div>
+          <div className="hud-stat muted">{hud?.biome}</div>
           <div className="hud-stat">
             Fala <b>{(((hud?.wave ?? 1) - 1) % 3) + 1}/3</b>
           </div>
@@ -87,11 +92,12 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
         </button>
         {!touch && (
           <div className="game-help">
-            <span><b>Klik</b> złap mysz · <b>Mysz</b>/<b>Q E</b> kamera</span>
+            <span><b>Klik</b> złap mysz · <b>Mysz</b>/<b>Z C</b> kamera</span>
             <span><b>WASD</b> ruch</span>
             <span><b>J</b>/<b>LPM</b> atak (combo ×3)</span>
             <span><b>K</b>/<b>PPM</b> specjalny</span>
-            <span><b>Spacja</b> unik</span>
+            <span><b>Spacja</b> skok (2× = salto)</span>
+            <span><b>Q</b> unik ×2 (też w locie, tuż przed ciosem = kontra)</span>
             <span><b>Esc</b> wyjście</span>
           </div>
         )}
@@ -101,6 +107,41 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
           </div>
         )}
       </div>
+
+      {hud?.hint && !hud.gameOver && !hud.stats && <div className="game-hint">⚠ {hud.hint}</div>}
+
+      {hud?.stats && !hud.gameOver && (
+        <div className="level-stats">
+          <h3>
+            POZIOM {hud.stats.level} UKOŃCZONY <small>{hud.stats.biome}</small>
+          </h3>
+          <div className="ls-grid">
+            <span>Czas</span>
+            <b>
+              {Math.floor(hud.stats.time / 60)}:{String(Math.floor(hud.stats.time % 60)).padStart(2, '0')}
+            </b>
+            <span>Pokonani</span>
+            <b>{hud.stats.kills}</b>
+            <span>…przez otoczenie</span>
+            <b>{hud.stats.envKills}</b>
+            <span>Zadane obrażenia</span>
+            <b>{hud.stats.dealt.toLocaleString()}</b>
+            <span>Otrzymane obrażenia</span>
+            <b>{hud.stats.taken.toLocaleString()}</b>
+            <span>Najdłuższe combo</span>
+            <b>{hud.stats.maxCombo}×</b>
+            <span>Perfekcyjne uniki</span>
+            <b>{hud.stats.perfect}</b>
+            <span>Monety z platform</span>
+            <b>{hud.stats.coins}</b>
+            <span>Apteczki</span>
+            <b>{hud.stats.heals}</b>
+            <span>Zarobione</span>
+            <b className="coin">+{hud.stats.earned.toLocaleString()} ◈</b>
+          </div>
+          <p>Wejdź w portal w arenie bossa, żeby przejść na nową mapę →</p>
+        </div>
+      )}
 
       {hud?.boss && !hud.gameOver && (
         <div className="boss-bar">
@@ -187,6 +228,9 @@ function TouchControls({ engine }: { engine: RefObject<GameEngine | null> }) {
       <div className="touch-btns">
         <button className="tb dodge" onPointerDown={btn('dodge')}>
           UNIK
+        </button>
+        <button className="tb jump" onPointerDown={btn('jump')}>
+          SKOK
         </button>
         <button className="tb special" onPointerDown={btn('special')}>
           SPEC

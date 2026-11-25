@@ -1,236 +1,12 @@
 import * as THREE from 'three'
+import { CELL, CITY_HALF, GH, GW, MAP, canvasTex, cx, cz, ci, cj, mergeGeos, wall } from './grid'
+import type { DecorCtx, Decor } from './world'
 
 // ─────────────────────────────────────────────────────────────
-//  Post-apo miasto za dnia: ulice i place między zrujnowanymi,
-//  zarośniętymi budynkami. Mapa generowana proceduralnie co poziom:
-//    '#' budynek (ściana)   '.' ulica   'P' plac   'S' start
-//    'B' arena bossa         'H' apteczka
-//  Wszystkie drogi (drzewo połączeń) prowadzą do areny bossa.
-//  Wrogowie chodzą po siatce (flow field z BFS od gracza).
+//  Biom miejski: post-apo ruiny za dnia albo neonowa noc.
+//  Zrujnowane, zarośnięte budynki, wraki aut, ogień, kable.
 // ─────────────────────────────────────────────────────────────
 
-let MAP: string[] = []
-export const CELL = 6
-let GW = 0
-let GH = 0
-/** połowa boku mapy w metrach — zmienia się razem z mapą (live binding) */
-export let CITY_HALF = 0
-
-/** Generuje nową, otwartą mapę: place połączone szerokimi ulicami, drzewo dróg zbiega się w arenie bossa. */
-export function generateMap(level: number, seed: number): string[] {
-  const rng = rngFrom(seed)
-  const ri = (a: number, b: number) => a + Math.floor(rng() * (b - a + 1))
-  const N = 21 + 2 * Math.min(level - 1, 3)
-  const g: string[][] = Array.from({ length: N }, () => Array(N).fill('#'))
-  const inside = (i: number, j: number) => i > 0 && j > 0 && i < N - 1 && j < N - 1
-  const set = (i: number, j: number, c: string, over = false) => {
-    if (!inside(i, j)) return
-    if (over || g[j][i] === '#') g[j][i] = c
-  }
-
-  // arena bossa (5×5) w losowej ćwiartce, z dala od środka
-  const BS = 5
-  const qx = rng() < 0.5
-  const qz = rng() < 0.5
-  const bx = qx ? ri(2, 4) : N - 2 - BS - ri(0, 2)
-  const bz = qz ? ri(2, 4) : N - 2 - BS - ri(0, 2)
-  for (let j = bz; j < bz + BS; j++) for (let i = bx; i < bx + BS; i++) g[j][i] = 'B'
-  const bossC: [number, number] = [bx + 2, bz + 2]
-  const nearBoss = (i: number, j: number) => i >= bx - 1 && i <= bx + BS && j >= bz - 1 && j <= bz + BS
-
-  // place (mogą na siebie zachodzić → nieregularne, otwarte przestrzenie)
-  const rooms: [number, number][] = []
-  const want = Math.min(14, 10 + level)
-  for (let tries = 0; tries < 600 && rooms.length < want; tries++) {
-    const w = ri(2, 4)
-    const h = ri(2, 4)
-    const x = ri(1, N - 1 - w)
-    const z = ri(1, N - 1 - h)
-    let bad = false
-    for (let j = z - 1; j <= z + h && !bad; j++) for (let i = x - 1; i <= x + w && !bad; i++) if (nearBoss(i, j)) bad = true
-    if (bad) continue
-    const c: [number, number] = [x + (w >> 1), z + (h >> 1)]
-    if (rooms.some(([a, b]) => Math.abs(a - c[0]) + Math.abs(b - c[1]) < 4)) continue
-    for (let j = z; j < z + h; j++) for (let i = x; i < x + w; i++) set(i, j, 'P')
-    rooms.push(c)
-  }
-
-  // ulica w kształcie L (szerokość 1–2) między dwoma punktami
-  const road = (a: [number, number], b: [number, number], wide: boolean) => {
-    let [i, j] = a
-    const hFirst = rng() < 0.5
-    const step = (axis: 'x' | 'z') => {
-      if (axis === 'x') while (i !== b[0]) {
-        set(i, j, '.')
-        if (wide) set(i, j + 1, '.')
-        i += Math.sign(b[0] - i)
-      }
-      else while (j !== b[1]) {
-        set(i, j, '.')
-        if (wide) set(i + 1, j, '.')
-        j += Math.sign(b[1] - j)
-      }
-    }
-    step(hFirst ? 'x' : 'z')
-    step(hFirst ? 'z' : 'x')
-    set(i, j, '.')
-  }
-
-  // drzewo dróg zakorzenione w arenie: każdy plac łączy się z najbliższym już połączonym
-  // węzłem, który leży bliżej bossa → idąc „w górę” drzewa zawsze dojdziesz do areny
-  const md = (a: [number, number], b: [number, number]) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1])
-  const connected: [number, number][] = [bossC]
-  const order = [...rooms].sort((a, b) => md(a, bossC) - md(b, bossC))
-  for (const r of order) {
-    let best = connected[0]
-    for (const c of connected) if (md(c, r) < md(best, r)) best = c
-    road(r, best, rng() < 0.8)
-    connected.push(r)
-  }
-  // kilka dodatkowych przejść (pętle) — mniej ślepych zaułków
-  for (let k = 0; k < 2 + (level >> 1); k++) {
-    const a = rooms[Math.floor(rng() * rooms.length)]
-    const b = rooms[Math.floor(rng() * rooms.length)]
-    if (a && b && a !== b) road(a, b, false)
-  }
-
-  // otwieranie: cienkie ściany między przestrzeniami zamieniamy w gruzowiska/ulice
-  const open = (i: number, j: number) => inside(i, j) && g[j][i] !== '#'
-  for (let pass = 0; pass < 2; pass++) {
-    const kill: [number, number][] = []
-    for (let j = 1; j < N - 1; j++)
-      for (let i = 1; i < N - 1; i++) {
-        if (g[j][i] !== '#' || nearBoss(i, j)) continue
-        let n = 0
-        for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) if ((di || dj) && open(i + di, j + dj)) n++
-        const thin = (open(i - 1, j) && open(i + 1, j)) || (open(i, j - 1) && open(i, j + 1))
-        if (n >= 6 || (thin && rng() < 0.35) || (n >= 4 && rng() < 0.18)) kill.push([i, j])
-      }
-    for (const [i, j] of kill) g[j][i] = '.'
-  }
-
-  // spójność: zostawiamy tylko to, co osiągalne z areny
-  const flood = (from: [number, number]) => {
-    const d = new Int32Array(N * N).fill(-1)
-    const q = [from[1] * N + from[0]]
-    d[q[0]] = 0
-    for (let h = 0; h < q.length; h++) {
-      const c = q[h]
-      const i = c % N
-      const j = (c / N) | 0
-      for (const [di, dj] of [
-        [1, 0],
-        [-1, 0],
-        [0, 1],
-        [0, -1],
-      ]) {
-        const ni = i + di
-        const nj = j + dj
-        if (!open(ni, nj) || d[nj * N + ni] >= 0) continue
-        d[nj * N + ni] = d[c] + 1
-        q.push(nj * N + ni)
-      }
-    }
-    return d
-  }
-  const dB = flood(bossC)
-  const cells: [number, number, number][] = []
-  for (let j = 1; j < N - 1; j++)
-    for (let i = 1; i < N - 1; i++) {
-      if (g[j][i] === '#') continue
-      if (dB[j * N + i] < 0) g[j][i] = '#'
-      else if (g[j][i] !== 'B') cells.push([i, j, dB[j * N + i]])
-    }
-
-  // start: jedno z najdalszych od areny miejsc
-  cells.sort((a, b) => b[2] - a[2])
-  const far = cells.slice(0, Math.max(1, Math.floor(cells.length * 0.08)))
-  const [si, sj] = far[Math.floor(rng() * far.length)]
-  g[sj][si] = 'S'
-  const maxD = cells[0][2]
-
-  // apteczki: rozrzucone po drodze (na placach jeśli się da) + jedna przed areną
-  const heals: [number, number][] = []
-  const tryHeal = (pool: [number, number, number][]) => {
-    for (let t = 0; t < 40 && pool.length; t++) {
-      const [i, j] = pool[Math.floor(rng() * pool.length)]
-      if (g[j][i] === 'S' || g[j][i] === 'H') continue
-      if (heals.some(([a, b]) => Math.abs(a - i) + Math.abs(b - j) < 5)) continue
-      if (Math.abs(i - si) + Math.abs(j - sj) < 3) continue
-      g[j][i] = 'H'
-      heals.push([i, j])
-      return
-    }
-  }
-  const mid = cells.filter(([, , d]) => d > 4 && d < maxD - 2)
-  const midPlaza = mid.filter(([i, j]) => g[j][i] === 'P')
-  const nHeals = 3 + Math.min(2, level >> 1)
-  for (let k = 0; k < nHeals; k++) tryHeal(midPlaza.length > k * 2 ? midPlaza : mid)
-  tryHeal(cells.filter(([, , d]) => d >= 2 && d <= 4))
-
-  return g.map((r) => r.join(''))
-}
-
-export interface Box {
-  minX: number
-  maxX: number
-  minZ: number
-  maxZ: number
-}
-
-export interface City {
-  boxes: Box[]
-  start: THREE.Vector3
-  spawnPoint(from: THREE.Vector3, min: number, max: number): THREE.Vector3
-  /** losowy punkt na ulicy/placu (poza areną bossa), co najmniej `minDist` od `avoid` */
-  randomPoint(avoid: THREE.Vector3, minDist: number): THREE.Vector3
-  /** środek areny bossa */
-  bossCenter: THREE.Vector3
-  /** czy punkt leży w arenie bossa */
-  inBossRoom(p: THREE.Vector3): boolean
-  /** miejsca apteczek */
-  heals: THREE.Vector3[]
-  /** kierunek ruchu wroga do celu (omija ściany) */
-  steer(from: THREE.Vector3, out: THREE.Vector3): THREE.Vector3
-  /** jak daleko kamera może odjechać od `target` w kierunku `dir`, zanim wejdzie w ścianę */
-  cameraDistance(target: THREE.Vector3, dir: THREE.Vector3, max: number): number
-  wallAt(x: number, z: number): boolean
-  update(time: number, dt: number, player: THREE.Vector3, camera: THREE.Vector3): void
-  drawMinimap(ctx: CanvasRenderingContext2D, size: number, player: THREE.Vector3, facing: number, enemies: THREE.Vector3[], camYaw?: number, pickups?: THREE.Vector3[]): void
-  dispose(): void
-}
-
-// ── siatka ──────────────────────────────────────────────────
-const wall = (i: number, j: number) => i < 0 || j < 0 || i >= GW || j >= GH || MAP[j][i] === '#'
-const cx = (i: number) => (i - GW / 2 + 0.5) * CELL
-const cz = (j: number) => (j - GH / 2 + 0.5) * CELL
-const ci = (x: number) => Math.floor(x / CELL + GW / 2)
-const cj = (z: number) => Math.floor(z / CELL + GH / 2)
-
-function rngFrom(seed: number) {
-  let a = seed
-  return () => {
-    a = (a + 0x6d2b79f5) | 0
-    let t = Math.imul(a ^ (a >>> 15), 1 | a)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
-
-// ── tekstury proceduralne ───────────────────────────────────
-function canvasTex(w: number, h: number, draw: (g: CanvasRenderingContext2D) => void, repeat = true) {
-  const c = document.createElement('canvas')
-  c.width = w
-  c.height = h
-  draw(c.getContext('2d')!)
-  const t = new THREE.CanvasTexture(c)
-  t.colorSpace = THREE.SRGBColorSpace
-  if (repeat) t.wrapS = t.wrapT = THREE.RepeatWrapping
-  t.anisotropy = 4
-  return t
-}
-
-/** Beton z wybitymi oknami, zaciekami, pęknięciami i mchem przy dole. */
 function facadeTex(rng: () => number, base: string) {
   return canvasTex(256, 256, (g) => {
     g.fillStyle = base
@@ -319,7 +95,7 @@ function ivyTex(rng: () => number) {
   )
 }
 
-function grassBladeTex() {
+export function grassBladeTex() {
   return canvasTex(
     64,
     128,
@@ -344,7 +120,7 @@ function grassBladeTex() {
   )
 }
 
-function neonTex(text: string) {
+function neonTex(text: string, glow = '#ff3ea5', fill = '#ff7ac4') {
   return canvasTex(
     512,
     128,
@@ -354,9 +130,9 @@ function neonTex(text: string) {
       g.font = 'bold 76px Impact, sans-serif'
       g.textAlign = 'center'
       g.textBaseline = 'middle'
-      g.shadowColor = '#ff3ea5'
+      g.shadowColor = glow
       g.shadowBlur = 20
-      g.fillStyle = '#ff7ac4'
+      g.fillStyle = fill
       g.fillText(text, 256, 68)
     },
     false,
@@ -364,7 +140,7 @@ function neonTex(text: string) {
 }
 
 /** Wstrzykuje kołysanie na wietrze do materiału (wierzchołki wyżej ruszają się mocniej). */
-function addWind(mat: THREE.Material, uTime: { value: number }, strength: number, heightScale: number) {
+export function addWind(mat: THREE.Material, uTime: { value: number }, strength: number, heightScale: number) {
   mat.onBeforeCompile = (sh) => {
     sh.uniforms.uTime = uTime
     sh.vertexShader = sh.vertexShader
@@ -391,44 +167,19 @@ function addWind(mat: THREE.Material, uTime: { value: number }, strength: number
 
 // ── budowa ──────────────────────────────────────────────────
 
-export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, seed = 2077): City {
-  MAP = generateMap(level, seed)
-  GW = MAP[0].length
-  GH = MAP.length
-  CITY_HALF = (GW * CELL) / 2
-  const rng = rngFrom(seed ^ 0x5bd1e995)
-  const disposables: { dispose(): void }[] = []
-  const group = new THREE.Group()
-  scene.add(group)
-  const uTime = { value: 0 }
-  const boxes: Box[] = []
-  const walk: [number, number][] = []
-  let start = new THREE.Vector3()
-  const heals: THREE.Vector3[] = []
-  const bossCells: [number, number][] = []
-  for (let j = 0; j < GH; j++)
-    for (let i = 0; i < GW; i++) {
-      if (MAP[j][i] === '#') boxes.push({ minX: cx(i) - CELL / 2, maxX: cx(i) + CELL / 2, minZ: cz(j) - CELL / 2, maxZ: cz(j) + CELL / 2 })
-      else walk.push([i, j])
-      if (MAP[j][i] === 'S') start = new THREE.Vector3(cx(i), 0, cz(j))
-      if (MAP[j][i] === 'H') heals.push(new THREE.Vector3(cx(i), 0, cz(j)))
-      if (MAP[j][i] === 'B') bossCells.push([i, j])
-    }
-  const bossCenter = new THREE.Vector3()
-  for (const [i, j] of bossCells) bossCenter.add(new THREE.Vector3(cx(i), 0, cz(j)))
-  bossCenter.divideScalar(Math.max(1, bossCells.length))
-  const T = <X extends { dispose(): void }>(x: X) => (disposables.push(x), x)
-
+export function decorateCity(ctx: DecorCtx, variant: 'day' | 'night'): Decor {
+  const { group, T, rng, uTime, walk, boxes, floorY, decks } = ctx
+  const night = variant === 'night'
   // ── niebo z chmurami + słońce ────────────────────────────
   const skyMat = T(
     new THREE.ShaderMaterial({
       side: THREE.BackSide,
       depthWrite: false,
       fog: false,
-      uniforms: { uTime },
+      uniforms: { uTime, uNight: { value: night ? 1 : 0 } },
       vertexShader: `varying vec3 vD; void main(){ vD = normalize(position); gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
       fragmentShader: `
-        uniform float uTime; varying vec3 vD;
+        uniform float uTime; uniform float uNight; varying vec3 vD;
         float h(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
         float n(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
           return mix(mix(h(i),h(i+vec2(1,0)),f.x), mix(h(i+vec2(0,1)),h(i+vec2(1,1)),f.x), f.y); }
@@ -445,6 +196,21 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
             float c = smoothstep(.48, .78, fbm(uv));
             col = mix(col, vec3(1.) * (.85 + .15*fbm(uv*2.+3.)), c * .85 * smoothstep(0., .25, y));
           }
+          if (uNight > .5) {
+            // noc: fiolet przy horyzoncie (łuna neonów), gwiazdy, księżyc, ciemne chmury
+            vec3 nc = mix(vec3(.32,.08,.36), vec3(.015,.012,.05), pow(max(y,0.), .45));
+            vec3 sd3 = vD * 260.;
+            float st = step(.9965, h(floor(sd3.xz) + floor(sd3.y))) * smoothstep(.05, .4, y);
+            nc += vec3(st) * (.6 + .4 * sin(uTime * 3. + sd3.x));
+            vec3 md = normalize(vec3(-.5,.42,.6));
+            float m = max(dot(vD, md), 0.);
+            nc += vec3(.9,.92,1.) * smoothstep(.9985, .9992, m) + vec3(.25,.25,.4) * pow(m, 60.);
+            if (y > 0.) {
+              vec2 uv = vD.xz / (y + .15) * 1.4 + vec2(uTime*.01, uTime*.003);
+              nc = mix(nc, vec3(.06,.04,.1), smoothstep(.5, .8, fbm(uv)) * .8 * smoothstep(0., .25, y));
+            }
+            col = nc;
+          }
           gl_FragColor = vec4(col, 1.);
         }`,
     }),
@@ -455,10 +221,10 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
   // ── ziemia: popękany asfalt + trawa + ziemia ─────────────
   const groundMat = T(
     new THREE.ShaderMaterial({
-      uniforms: { uCell: { value: CELL } },
+      uniforms: { uCell: { value: CELL }, uNight: { value: night ? 1 : 0 } },
       vertexShader: `varying vec2 vW; void main(){ vec4 w = modelMatrix*vec4(position,1.); vW = w.xz; gl_Position = projectionMatrix*viewMatrix*w; }`,
       fragmentShader: `
-        uniform float uCell; varying vec2 vW;
+        uniform float uCell; uniform float uNight; varying vec2 vW;
         float h(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
         float n(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
           return mix(mix(h(i),h(i+vec2(1,0)),f.x), mix(h(i+vec2(0,1)),h(i+vec2(1,1)),f.x), f.y); }
@@ -481,6 +247,13 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
           // resztki pasów
           float lane = step(abs(fract(vW.x/uCell)-.5), .012) * step(.5, fract(vW.y/3.)) * (1.-grass) * step(.45, n(vW*.2));
           col = mix(col, vec3(.8,.74,.5), lane*.5);
+          if (uNight > .5) {
+            // mokry asfalt: kałuże odbijające neony
+            col *= .32;
+            float pud = smoothstep(.52, .66, fbm(vW*.22 + 2.));
+            vec3 refl = mix(vec3(1.,.2,.7), vec3(.2,.8,1.), fbm(vW*.08 + 5.)) * (.25 + .35*fbm(vW*1.5));
+            col = mix(col, vec3(.03,.03,.06) + refl, pud * .75);
+          }
           gl_FragColor = vec4(col, 1.);
           #include <fog_fragment>
         }`,
@@ -648,7 +421,7 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
     if (!dense && rng() < 0.6) continue
     const s = 0.6 + rng() * (dense ? 1.1 : 0.6)
     q.setFromAxisAngle(up, rng() * Math.PI)
-    m4.compose(new THREE.Vector3(x, 0, z), q, new THREE.Vector3(s, s * (0.8 + rng() * 0.6), s))
+    m4.compose(new THREE.Vector3(x, floorY(i, j), z), q, new THREE.Vector3(s, s * (0.8 + rng() * 0.6), s))
     grass.setMatrixAt(gi++, m4)
   }
   grass.count = gi
@@ -671,7 +444,7 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
     const x = cx(i) + (side === 0 ? e : side === 1 ? -e : off)
     const z = cz(j) + (side === 2 ? e : side === 3 ? -e : off)
     const s = 0.7 + rng() * 1.1
-    m4.compose(new THREE.Vector3(x, s * 0.35, z), q.setFromAxisAngle(up, rng() * 6), new THREE.Vector3(s, s * 0.75, s))
+    m4.compose(new THREE.Vector3(x, floorY(i, j) + s * 0.35, z), q.setFromAxisAngle(up, rng() * 6), new THREE.Vector3(s, s * 0.75, s))
     bushes.setMatrixAt(b, m4)
     bushes.setColorAt(b, bushCol.setHSL(0.22 + rng() * 0.08, 0.45, 0.22 + rng() * 0.12))
   }
@@ -687,7 +460,8 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
   trunkGeo.translate(0, 2, 0)
   const crownGeo = T(new THREE.IcosahedronGeometry(1.6, 1))
   const treeSpots: THREE.Vector3[] = []
-  const plazaCells = walk.filter(([i, j]) => MAP[j][i] === 'P')
+  const underDeck = (i: number, j: number) => decks.some((d) => d.cells.some(([a, b]) => a === i && b === j))
+  const plazaCells = walk.filter(([i, j]) => MAP[j][i] === 'P' && !underDeck(i, j))
   for (const [i, j] of plazaCells) {
     if (rng() < 0.45) continue
     const x = cx(i) + (rng() - 0.5) * (CELL - 2.5)
@@ -704,7 +478,7 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
       c.castShadow = true
       t.add(c)
     }
-    t.position.set(x, 0, z)
+    t.position.set(x, floorY(i, j), z)
     t.scale.setScalar(s)
     t.rotation.y = rng() * 6
     group.add(t)
@@ -768,7 +542,7 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
     const x = cx(i) + (side === 0 ? e : side === 1 ? -e : off)
     const z = cz(j) + (side === 2 ? e : side === 3 ? -e : off)
     const s = 0.4 + rng() * 1.3
-    m4.compose(new THREE.Vector3(x, s * 0.12, z), q.setFromEuler(new THREE.Euler(rng() * 6, rng() * 6, rng() * 6)), new THREE.Vector3(s, s * 0.6, s))
+    m4.compose(new THREE.Vector3(x, floorY(i, j) + s * 0.12, z), q.setFromEuler(new THREE.Euler(rng() * 6, rng() * 6, rng() * 6)), new THREE.Vector3(s, s * 0.6, s))
     rubble.setMatrixAt(r, m4)
     rubble.setColorAt(r, bushCol.setHSL(0.08, 0.08, 0.42 + rng() * 0.15))
   }
@@ -788,21 +562,22 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
   for (const [i, j] of plazaCells.filter(() => rng() < 0.35).slice(0, 7)) {
     const x = cx(i) + (rng() - 0.5) * 3
     const z = cz(j) + (rng() - 0.5) * 3
+    const fy = floorY(i, j)
     const b = new THREE.Mesh(barrelGeo, barrelMat)
-    b.position.set(x, 0, z)
+    b.position.set(x, fy, z)
     b.castShadow = true
     group.add(b)
     const f1 = new THREE.Mesh(flameGeo, flameMat)
     const f2 = new THREE.Mesh(flameGeo, flameMat2)
-    f1.position.set(x, 1.05, z)
-    f2.position.set(x, 1.05, z)
+    f1.position.set(x, fy + 1.05, z)
+    f2.position.set(x, fy + 1.05, z)
     f2.scale.setScalar(0.55)
     group.add(f1, f2)
     const light = new THREE.PointLight(0xff8a3a, 8, 9, 1.6)
-    light.position.set(x, 1.8, z)
+    light.position.set(x, fy + 1.8, z)
     group.add(light)
-    fires.push({ light, f1, f2, pos: new THREE.Vector3(x, 1.5, z), phase: rng() * 10 })
-    boxes.push({ minX: x - 0.45, maxX: x + 0.45, minZ: z - 0.45, maxZ: z + 0.45 })
+    fires.push({ light, f1, f2, pos: new THREE.Vector3(x, fy + 1.5, z), phase: rng() * 10 })
+    boxes.push({ minX: x - 0.45, maxX: x + 0.45, minZ: z - 0.45, maxZ: z + 0.45, top: fy + 1.1 })
   }
   // dym: wspólna pula sprite'ów
   const smokeTex = T(
@@ -865,10 +640,18 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
 
   // ── migoczący, zepsuty neon ──────────────────────────────
   const neonMats: THREE.MeshBasicMaterial[] = []
-  const neonWords = ['RANDOM PLAY', 'HOTEL', 'NOODLES', 'OPEN 24', 'ARCADE']
+  const neonWords = ['RANDOM PLAY', 'HOTEL', 'NOODLES', 'OPEN 24', 'ARCADE', 'HOLLOW', 'BAR', 'SIXTH ST', 'KARAOKE', 'RAMEN']
+  const neonCols: [string, string, number][] = [
+    ['#ff3ea5', '#ff7ac4', 0xff3ea5],
+    ['#3ee8ff', '#9ff4ff', 0x3ee8ff],
+    ['#b04dff', '#d9a6ff', 0xb04dff],
+    ['#ffd23f', '#fff0a0', 0xffc23f],
+  ]
+  const maxNeons = night ? 18 : 5
   let neons = 0
+  let neonLights = 0
   for (const [i, j] of walk) {
-    if (neons >= 5 || rng() > 0.08) continue
+    if (neons >= maxNeons || rng() > (night ? 0.25 : 0.08)) continue
     for (const [dx, dz] of [
       [1, 0],
       [-1, 0],
@@ -876,13 +659,20 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
       [0, -1],
     ]) {
       if (!wall(i + dx, j + dz)) continue
-      const mat = T(new THREE.MeshBasicMaterial({ map: T(neonTex(neonWords[neons % neonWords.length])), transparent: true, side: THREE.DoubleSide }))
+      const [glow, fill, lc] = neonCols[night ? neons % neonCols.length : 0]
+      const mat = T(new THREE.MeshBasicMaterial({ map: T(neonTex(neonWords[neons % neonWords.length], glow, fill)), transparent: true, side: THREE.DoubleSide }))
       const sign = new THREE.Mesh(T(new THREE.PlaneGeometry(3, 0.75)), mat)
       sign.position.set(cx(i) + dx * (CELL / 2 - 0.05), 3.4, cz(j) + dz * (CELL / 2 - 0.05))
       sign.rotation.y = Math.atan2(-dx, -dz)
       sign.rotation.z = (rng() - 0.5) * 0.25 // przekrzywiony
       group.add(sign)
       neonMats.push(mat)
+      if (night && neonLights < 8) {
+        const l = new THREE.PointLight(lc, 10, 11, 1.6)
+        l.position.set(cx(i) + dx * (CELL / 2 - 1.2), 3.2, cz(j) + dz * (CELL / 2 - 1.2))
+        group.add(l)
+        neonLights++
+      }
       neons++
       break
     }
@@ -923,11 +713,11 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
     r.scale.x = -1
     g.add(l, r)
     group.add(g)
-    butterflies.push({ g, l, r, home: new THREE.Vector3(cx(i), 0.8, cz(j)), ph: rng() * 20 })
+    butterflies.push({ g, l, r, home: new THREE.Vector3(cx(i), floorY(i, j) + 0.8, cz(j)), ph: rng() * 20 })
   }
 
   // ── pyłki / kurz w słońcu (wokół gracza) ─────────────────
-  const MOTES = 260
+  const MOTES = night ? 120 : 260
   const moteArr = new Float32Array(MOTES * 3)
   for (let k = 0; k < MOTES; k++) moteArr.set([(rng() - 0.5) * 30, rng() * 6, (rng() - 0.5) * 30], k * 3)
   const moteGeo = T(new THREE.BufferGeometry())
@@ -969,119 +759,11 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
   group.add(sparkLight)
   const sparkState = { t: 2, life: 0 }
 
-  // ── flow field (BFS) ─────────────────────────────────────
-  const dist = new Int32Array(GW * GH).fill(-1)
-  let fieldCell = -1
-  const rebuildField = (pi: number, pj: number) => {
-    const id = pj * GW + pi
-    if (id === fieldCell) return
-    fieldCell = id
-    dist.fill(-1)
-    if (wall(pi, pj)) return
-    const queue = [id]
-    dist[id] = 0
-    for (let h = 0; h < queue.length; h++) {
-      const c = queue[h]
-      const i = c % GW
-      const j = (c / GW) | 0
-      for (const [dx, dz] of [
-        [1, 0],
-        [-1, 0],
-        [0, 1],
-        [0, -1],
-      ]) {
-        const ni = i + dx
-        const nj = j + dz
-        if (wall(ni, nj)) continue
-        const n = nj * GW + ni
-        if (dist[n] >= 0) continue
-        dist[n] = dist[c] + 1
-        queue.push(n)
-      }
-    }
-  }
-  const target = new THREE.Vector3()
-  const wallAt = (x: number, z: number) => wall(ci(x), cj(z))
-  const losClear = (a: THREE.Vector3, b: THREE.Vector3, margin: number) => {
-    const d = a.distanceTo(b)
-    const n = Math.ceil(d / 0.5)
-    for (let k = 1; k < n; k++) {
-      const t = k / n
-      const x = a.x + (b.x - a.x) * t
-      const z = a.z + (b.z - a.z) * t
-      if (wallAt(x + margin, z) || wallAt(x - margin, z) || wallAt(x, z + margin) || wallAt(x, z - margin)) return false
-    }
-    return true
-  }
+  // ── platformy (rusztowania) i wyrzutnie (kratki wentylacyjne) ─
+  decorateDecksCity(ctx)
 
-  // ── API ──────────────────────────────────────────────────
   return {
-    boxes,
-    start,
-    wallAt,
-    bossCenter,
-    heals,
-    inBossRoom: (p) => MAP[cj(p.z)]?.[ci(p.x)] === 'B',
-    randomPoint(avoid, minDist) {
-      const pool = walk.filter(([i, j]) => MAP[j][i] !== 'B' && Math.hypot(cx(i) - avoid.x, cz(j) - avoid.z) >= minDist)
-      const src = pool.length ? pool : walk
-      const [i, j] = src[Math.floor(Math.random() * src.length)]
-      return new THREE.Vector3(cx(i) + (Math.random() - 0.5) * (CELL - 2), 0, cz(j) + (Math.random() - 0.5) * (CELL - 2))
-    },
-    spawnPoint(from, min, max) {
-      const pi = ci(from.x)
-      const pj = cj(from.z)
-      rebuildField(pi, pj)
-      // komórki osiągalne w [min,max] kroków ścieżki, losowo
-      const cand = walk.filter(([i, j]) => {
-        const d = dist[j * GW + i] * CELL
-        return d >= min && d <= max
-      })
-      const pool = cand.length ? cand : walk
-      const [i, j] = pool[Math.floor(Math.random() * pool.length)]
-      return new THREE.Vector3(cx(i) + (Math.random() - 0.5) * (CELL - 2), 0, cz(j) + (Math.random() - 0.5) * (CELL - 2))
-    },
-    steer(from, out) {
-      // cel = gracz; w zasięgu wzroku → prosto, inaczej po flow field
-      if (losClear(from, target, 0.45)) return out.copy(target).sub(from).setY(0).normalize()
-      const i = ci(from.x)
-      const j = cj(from.z)
-      let best = dist[j * GW + i]
-      let bi = i
-      let bj = j
-      for (const [dx, dz] of [
-        [1, 0],
-        [-1, 0],
-        [0, 1],
-        [0, -1],
-      ]) {
-        const d = wall(i + dx, j + dz) ? -1 : dist[(j + dz) * GW + i + dx]
-        if (d >= 0 && (best < 0 || d < best)) {
-          best = d
-          bi = i + dx
-          bj = j + dz
-        }
-      }
-      out.set(cx(bi) - from.x, 0, cz(bj) - from.z)
-      if (out.lengthSq() < 0.01) out.copy(target).sub(from).setY(0)
-      return out.normalize()
-    },
-    cameraDistance(t, dir, max) {
-      const steps = Math.ceil(max / 0.15)
-      for (let k = 1; k <= steps; k++) {
-        const d = (k / steps) * max
-        const x = t.x + dir.x * d
-        const z = t.z + dir.z * d
-        const y = t.y + dir.y * d
-        if (y < 0.3) return Math.max(0.6, d - 0.3)
-        if (wallAt(x + 0.3, z) || wallAt(x - 0.3, z) || wallAt(x, z + 0.3) || wallAt(x, z - 0.3)) return Math.max(0.6, d - 0.25)
-      }
-      return max
-    },
     update(time, dt, player, camera) {
-      uTime.value = time
-      target.copy(player)
-      rebuildField(ci(player.x), cj(player.z))
       sky.position.set(camera.x, 0, camera.z)
 
       // ogień
@@ -1207,111 +889,57 @@ export function buildCity(scene: THREE.Scene, accent: THREE.Color, level = 1, se
           ga.setXYZ(k, ga.getX(k) + gustState.dir.x * dt * (6 + (k % 5)), ga.getY(k) + Math.sin(gl * 3 + k) * dt * 0.6, ga.getZ(k) + gustState.dir.z * dt * (6 + (k % 5)))
         ga.needsUpdate = true
       }
-    },
-    drawMinimap(ctx, size, player, facing, enemies, camYaw = 0, pickups = []) {
-      const R = 30
-      const s = size / (R * 2)
-      ctx.clearRect(0, 0, size, size)
-      ctx.save()
-      ctx.beginPath()
-      ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2)
-      ctx.clip()
-      ctx.fillStyle = 'rgba(30,36,24,0.85)'
-      ctx.fillRect(0, 0, size, size)
-      // obracamy mapę razem z kamerą (góra = kierunek patrzenia)
-      ctx.translate(size / 2, size / 2)
-      ctx.rotate(camYaw - Math.PI)
-      ctx.translate(-size / 2, -size / 2)
-      const tx = (x: number) => (x - player.x) * s + size / 2
-      const tz = (z: number) => (z - player.z) * s + size / 2
-      for (let j = 0; j < GH; j++)
-        for (let i = 0; i < GW; i++) {
-          const c = MAP[j][i]
-          ctx.fillStyle = c === '#' ? 'rgba(150,140,120,0.75)' : c === 'P' ? 'rgba(110,150,70,0.5)' : c === 'B' ? 'rgba(255,62,90,0.35)' : 'rgba(255,255,255,0.08)'
-          ctx.fillRect(tx(cx(i) - CELL / 2), tz(cz(j) - CELL / 2), CELL * s + 0.5, CELL * s + 0.5)
-        }
-      ctx.fillStyle = '#5dff8a'
-      for (const h of pickups) {
-        ctx.beginPath()
-        ctx.arc(tx(h.x), tz(h.z), 3.5, 0, Math.PI * 2)
-        ctx.fill()
-      }
-      ctx.fillStyle = '#ff3e5a'
-      for (const e of enemies) {
-        ctx.beginPath()
-        ctx.arc(tx(e.x), tz(e.z), 3, 0, Math.PI * 2)
-        ctx.fill()
-      }
-      ctx.translate(size / 2, size / 2)
-      ctx.rotate(-facing + Math.PI)
-      ctx.fillStyle = '#' + accent.getHexString()
-      ctx.beginPath()
-      ctx.moveTo(0, -7)
-      ctx.lineTo(5, 5)
-      ctx.lineTo(-5, 5)
-      ctx.closePath()
-      ctx.fill()
-      ctx.restore()
-    },
-    dispose() {
-      scene.remove(group)
-      disposables.forEach((d) => d.dispose())
-    },
+        },
   }
 }
 
-/** Skleja kilka geometrii (z tymi samymi atrybutami) w jedną. */
-function mergeGeos(geos: THREE.BufferGeometry[]) {
-  const out = new THREE.BufferGeometry()
-  for (const name of ['position', 'normal', 'uv']) {
-    const parts = geos.map((g) => g.getAttribute(name) as THREE.BufferAttribute)
-    const total = parts.reduce((s, p) => s + p.array.length, 0)
-    const arr = new Float32Array(total)
-    let o = 0
-    for (const p of parts) {
-      arr.set(p.array as Float32Array, o)
-      o += p.array.length
-    }
-    out.setAttribute(name, new THREE.BufferAttribute(arr, parts[0].itemSize))
-  }
-  const idx: number[] = []
-  let base = 0
-  for (const g of geos) {
-    const ix = g.getIndex()
-    if (ix) for (let k = 0; k < ix.count; k++) idx.push(ix.getX(k) + base)
-    base += g.getAttribute('position').count
-  }
-  out.setIndex(idx)
-  return out
-}
-
-/** Wypycha okrąg (p, r) z prostokątów; zwraca true, jeśli była kolizja. */
-export function pushOutOfBoxes(p: THREE.Vector3, r: number, boxes: Box[]) {
-  let hit = false
-  for (const b of boxes) {
-    if (p.x < b.minX - r || p.x > b.maxX + r || p.z < b.minZ - r || p.z > b.maxZ + r) continue
-    const qx = THREE.MathUtils.clamp(p.x, b.minX, b.maxX)
-    const qz = THREE.MathUtils.clamp(p.z, b.minZ, b.maxZ)
-    const dx = p.x - qx
-    const dz = p.z - qz
-    const d2 = dx * dx + dz * dz
-    if (d2 >= r * r) continue
-    hit = true
-    if (d2 > 1e-8) {
-      const d = Math.sqrt(d2)
-      p.x = qx + (dx / d) * r
-      p.z = qz + (dz / d) * r
-    } else {
-      const l = p.x - b.minX
-      const rr = b.maxX - p.x
-      const t = p.z - b.minZ
-      const bt = b.maxZ - p.z
-      const m = Math.min(l, rr, t, bt)
-      if (m === l) p.x = b.minX - r
-      else if (m === rr) p.x = b.maxX + r
-      else if (m === t) p.z = b.minZ - r
-      else p.z = b.maxZ + r
+/** Rusztowania z blachy + kratki z podmuchem. */
+function decorateDecksCity(ctx: DecorCtx) {
+  const { group, T, decks, pads } = ctx
+  const plateMat = T(new THREE.MeshStandardMaterial({ color: 0x6d6a63, roughness: 0.6, metalness: 0.6 }))
+  const railMat = T(new THREE.MeshStandardMaterial({ color: 0xc2552c, roughness: 0.7, metalness: 0.4 }))
+  const legGeo = T(new THREE.CylinderGeometry(0.07, 0.07, 1, 6))
+  legGeo.translate(0, 0.5, 0)
+  for (const d of decks) {
+    for (const [i, j] of d.cells) {
+      const plate = new THREE.Mesh(T(new THREE.BoxGeometry(CELL, 0.25, CELL)), plateMat)
+      plate.position.set(cx(i), d.y - 0.125, cz(j))
+      plate.castShadow = true
+      plate.receiveShadow = true
+      group.add(plate)
+      for (const [sx, sz] of [
+        [-1, -1],
+        [1, -1],
+        [-1, 1],
+        [1, 1],
+      ]) {
+        const leg = new THREE.Mesh(legGeo, railMat)
+        leg.position.set(cx(i) + sx * (CELL / 2 - 0.2), ctx.floorY(i, j), cz(j) + sz * (CELL / 2 - 0.2))
+        leg.scale.y = d.y - ctx.floorY(i, j)
+        group.add(leg)
+      }
+      // poręcz wzdłuż krawędzi bez sąsiedniej płyty
+      for (const [dx, dz] of [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ]) {
+        if (d.cells.some(([a, b]) => a === i + dx && b === j + dz)) continue
+        const along = dx === 0
+        const rail = new THREE.Mesh(T(new THREE.BoxGeometry(along ? CELL : 0.08, 0.08, along ? 0.08 : CELL)), railMat)
+        rail.position.set(cx(i) + dx * (CELL / 2 - 0.05), d.y + 0.9, cz(j) + dz * (CELL / 2 - 0.05))
+        group.add(rail)
+      }
     }
   }
-  return hit
+  const grateMat = T(new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.5, metalness: 0.8, emissive: 0x3ee8ff, emissiveIntensity: 0.25 }))
+  for (const p of pads) {
+    const g = new THREE.Mesh(T(new THREE.CylinderGeometry(0.85, 0.95, 0.12, 16)), grateMat)
+    g.position.copy(p.pos).setY(p.pos.y + 0.06)
+    group.add(g)
+    const glow = new THREE.Mesh(T(new THREE.CylinderGeometry(0.7, 0.85, 3.2, 16, 1, true)), T(new THREE.MeshBasicMaterial({ color: 0x9ff4ff, transparent: true, opacity: 0.12, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide })))
+    glow.position.copy(p.pos).setY(p.pos.y + 1.6)
+    group.add(glow)
+  }
 }
