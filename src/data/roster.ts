@@ -127,10 +127,10 @@ const STANDARD_S = agentsOf('S').map((i) => i.id)
 
 const lim1S = pickAgent('S', 'Jane Doe')
 const lim2S = pickAgent('S', 'Burnice White', [lim1S ?? ''])
-const lim1A = [pickAgent('A', 'Seth Lowell'), pickAgent('A', 'Soukaku')].filter((x): x is string => !!x)
-const lim2A = [pickAgent('A', 'Piper Wheel'), pickAgent('A', 'Ben Bigger')].filter((x): x is string => !!x)
+/** banery agentów: A-rangi losowane z całej puli A-agentów (bez rate-upu) */
+const A_AGENT_IDS = agentsOf('A').map((i) => i.id)
 
-// ── dodatkowe banery: każdy S-agent ma własny limitowany baner, A-rangi rotują parami ──
+// ── dodatkowe banery: każdy S-agent ma własny limitowany baner ──
 const BANNER_NAMES = [
   'Signal Overload', 'Hollow Pulse', 'Midnight Static', 'Neon Requiem', 'Ether Bloom', 'Zero Hour',
   'Ghost Frequency', 'Crimson Relay', 'Silent Ether', 'Glass Horizon', 'Feedback Loop', 'Wild Card',
@@ -142,7 +142,6 @@ const BANNER_NAMES = [
   'Rogue Wave', 'Slow Burn', 'Encore', 'Sudden Death', 'Crossfade', 'Pale Fire', 'Hot Wire',
 ]
 const usedS = new Set([lim1S, lim2S])
-const A_IDS = agentsOf('A').map((i) => i.id)
 const EXTRA_LIMITED: Banner[] = agentsOf('S')
   .filter((i) => !usedS.has(i.id))
   .map((it, k) => ({
@@ -151,7 +150,7 @@ const EXTRA_LIMITED: Banner[] = agentsOf('S')
     name: BANNER_NAMES[k % BANNER_NAMES.length],
     subtitle: 'Exclusive Channel',
     featuredS: it.id,
-    featuredA: A_IDS.length ? [A_IDS[(k * 2) % A_IDS.length], A_IDS[(k * 2 + 1) % A_IDS.length]].filter((x, i, a) => a.indexOf(x) === i) : [],
+    poolA: A_AGENT_IDS,
     standardS: STANDARD_S,
     accent: it.element ? ELEMENT_COLORS[it.element][0] : '#7cffd4',
   }))
@@ -163,7 +162,7 @@ export const BANNERS: Banner[] = [
     name: 'No Match Found',
     subtitle: 'Exclusive Channel',
     featuredS: lim1S,
-    featuredA: lim1A,
+    poolA: A_AGENT_IDS,
     standardS: STANDARD_S,
     accent: '#4d7cff',
   },
@@ -173,7 +172,7 @@ export const BANNERS: Banner[] = [
     name: 'Born to Burn',
     subtitle: 'Exclusive Channel',
     featuredS: lim2S,
-    featuredA: lim2A,
+    poolA: A_AGENT_IDS,
     standardS: STANDARD_S,
     accent: '#ff4d2e',
   },
