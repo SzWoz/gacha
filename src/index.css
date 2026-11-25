@@ -187,6 +187,22 @@ blockquote { margin: 8px 0 0; font-size: 20px; font-style: italic; color: #d8d2f
 .splash.rank-A .rank-stamp { font-size: 140px; }
 .splash.rank-B .rank-stamp { font-size: 110px; }
 
+/* ── 3D wejście postaci (HeroReveal) ───────── */
+.hero-layer { position: absolute; inset: 0; z-index: 1; }
+.hero-layer canvas { display: block; width: 100%; height: 100%; }
+.hero-flash { position: absolute; inset: 0; pointer-events: none; opacity: 0; mix-blend-mode: screen; }
+.splash.is-3d { background: #05040a; }
+.splash.is-3d::after {
+  content: ''; position: absolute; inset: 0; z-index: 2; pointer-events: none;
+  background: linear-gradient(90deg, rgba(5,4,10,.82) 0%, rgba(5,4,10,.45) 35%, transparent 60%);
+}
+.splash.is-3d .splash-name span { text-shadow: 4px 4px 0 color-mix(in srgb, var(--rc) 60%, #000), 0 0 30px rgba(0,0,0,.8); }
+.hero-wait {
+  position: absolute; z-index: 3; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  font-family: var(--display); letter-spacing: .5em; text-transform: uppercase; color: var(--rc);
+  text-shadow: 0 0 20px var(--rc); animation: blink .8s infinite;
+}
+
 .summary { position: absolute; inset: 0; z-index: 10; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 36px; cursor: default;
   background: radial-gradient(ellipse at center, #1a1030, #05040a 70%);
 }
@@ -298,6 +314,7 @@ table.history { width: 100%; border-collapse: collapse; background: rgba(7,6,13,
   blockquote { font-size: 15px; }
   .sparks { left: 50%; top: 40%; }
   .tap-hint { bottom: calc(18px + env(safe-area-inset-bottom)); font-size: 10px; white-space: nowrap; }
+  .splash.is-3d::after { background: linear-gradient(0deg, rgba(5,4,10,.9) 0%, rgba(5,4,10,.55) 35%, transparent 60%); }
 
   /* 10-pull summary: 3 per row, scrollable */
   .summary { justify-content: flex-start; gap: 18px; padding: 56px 12px 40px; }
@@ -351,6 +368,14 @@ table.history { width: 100%; border-collapse: collapse; background: rgba(7,6,13,
 .dmg.crit { font-size: 32px; color: var(--el, #ffcc00); }
 .dmg.hurt { color: #ff3e5a; font-size: 26px; }
 .dmg.heal { color: #7cffd4; }
+.dmg.super { font-size: 22px; letter-spacing: .06em; color: #fff; text-transform: uppercase; text-shadow: 0 0 14px var(--el, #7cffd4), 0 2px 0 #000; white-space: nowrap; }
+.dmg.coin { color: #ffb800; font-size: 20px; text-shadow: 0 0 10px rgba(255,184,0,.7), 0 2px 0 #000; }
+.hud-stat.coin b { color: #ffb800; }
+.game-minimap {
+  position: absolute; z-index: 3; right: 18px; bottom: 18px; width: 160px; height: 160px; border-radius: 50%; pointer-events: none;
+  box-shadow: 0 0 0 2px rgba(255,255,255,.15), 0 0 24px rgba(0,0,0,.6);
+}
+@media (max-width: 760px), (pointer: coarse) { .game-minimap { width: 104px; height: 104px; top: calc(150px + env(safe-area-inset-top)); bottom: auto; right: 12px; } }
 
 .game-hud { position: absolute; inset: 0; pointer-events: none; padding: calc(14px + env(safe-area-inset-top)) 18px 14px; }
 .game-hud button { pointer-events: auto; }
@@ -381,6 +406,12 @@ table.history { width: 100%; border-collapse: collapse; background: rgba(7,6,13,
 .game-help b { color: var(--fg); padding: 1px 5px; border: 1px solid rgba(255,255,255,.25); margin-right: 2px; }
 .game-model-tag { position: absolute; left: 18px; bottom: 14px; font-size: 10px; color: var(--muted); letter-spacing: .08em; max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.boss-bar {
+  position: absolute; top: 18px; left: 50%; transform: translateX(-50%); width: min(520px, 70vw); height: 14px;
+  border: 1px solid rgba(255,62,90,.7); background: rgba(20,4,8,.6); z-index: 6; pointer-events: none;
+}
+.boss-bar i { display: block; height: 100%; background: linear-gradient(90deg, #ff3e5a, #ff9a3e); transition: width .15s; }
+.boss-bar span { position: absolute; top: -18px; left: 0; font-family: var(--display); font-size: 13px; letter-spacing: .2em; color: #ff3e5a; }
 .game-banner {
   position: absolute; left: 50%; top: 22%; translate: -50% 0; pointer-events: none;
   font-family: var(--display); font-size: clamp(40px, 8vw, 84px); letter-spacing: .1em; color: #fff;

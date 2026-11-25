@@ -4,7 +4,7 @@ import { BannerView } from './components/BannerView'
 import { Collection } from './components/Collection'
 import { History } from './components/History'
 import { PullSequence } from './components/PullSequence'
-import { BANNERS, type Banner } from './data/roster'
+import { BANNERS, ITEMS, type Banner } from './data/roster'
 import { PlayView } from './game/PlayView'
 import type { PullResult } from './lib/gacha'
 import { isMuted, setMuted, sfx } from './lib/sfx'
@@ -17,7 +17,7 @@ export default function App() {
   const { save, pull, topUp, reset } = useSave()
   const [tab, setTab] = useState<Tab>('banners')
   const [banner, setBanner] = useState<Banner>(BANNERS[0])
-  const [results, setResults] = useState<PullResult[] | null>(null)
+  const [results, setResults] = useState<PullResult[] | null>(devRevealFromUrl)
   const [muted, setM] = useState(isMuted())
   const [toast, setToast] = useState<string | null>(null)
   const [inGame, setInGame] = useState(false)
@@ -35,7 +35,8 @@ export default function App() {
 
   return (
     <div className={`app ${inGame ? 'in-game' : ''}`}>
-      {!inGame && <BackgroundScene accent={tab === 'banners' ? banner.accent : '#7cffd4'} />}
+      {/* tło lobby nie renderuje się w grze ani pod animacją losowania (oszczędza GPU) */}
+      {!inGame && !results && <BackgroundScene accent={tab === 'banners' ? banner.accent : '#7cffd4'} />}
       <div className="scanlines" />
 
       {!inGame && (
@@ -111,7 +112,7 @@ export default function App() {
             )}
             {tab === 'collection' && <Collection owned={save.owned} />}
             {tab === 'history' && <History save={save} onReset={reset} />}
-            {tab === 'play' && <PlayView owned={save.owned} onInGame={setInGame} />}
+            {tab === 'play' && <PlayView owned={save.owned} onInGame={setInGame} onReward={topUp} />}
           </motion.div>
         </AnimatePresence>
       </main>
@@ -127,4 +128,14 @@ export default function App() {
       {results && <PullSequence results={results} onClose={() => setResults(null)} />}
     </div>
   )
+}
+
+/** DEV: ?reveal=Jane%20Doe,Ellen%20Joe — od razu odpala animację losowania dla podanych agentów. */
+function devRevealFromUrl(): PullResult[] | null {
+  if (!import.meta.env.DEV) return null
+  const q = new URLSearchParams(location.search).get('reveal')
+  if (!q) return null
+  const names = q.split(',').map((n) => n.trim().toLowerCase())
+  const items = names.map((n) => ITEMS.find((i) => i.kind === 'agent' && i.name.toLowerCase() === n)).filter((i) => !!i)
+  return items.length ? items.map((item) => ({ item, pityAt: 0, featured: true, lost5050: false, isNew: true })) : null
 }

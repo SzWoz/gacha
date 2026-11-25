@@ -5,14 +5,16 @@ import { GameEngine, type GameAction, type HudState } from './engine'
 
 const isTouch = () => typeof window !== 'undefined' && (window.matchMedia?.('(pointer: coarse)').matches || 'ontouchstart' in window)
 
-export function Game({ agent, onExit, onChangeAgent }: { agent: Item; onExit: () => void; onChangeAgent: () => void }) {
+export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; onExit: () => void; onChangeAgent: () => void; onReward?: (amount: number) => void }) {
+  const rewardRef = useRef(onReward)
+  rewardRef.current = onReward
   const mount = useRef<HTMLDivElement>(null)
   const engine = useRef<GameEngine | null>(null)
   const [hud, setHud] = useState<HudState | null>(null)
   const [touch] = useState(isTouch)
 
   useEffect(() => {
-    const eng = new GameEngine(mount.current!, { agent, onHud: setHud })
+    const eng = new GameEngine(mount.current!, { agent, onHud: setHud, onReward: (n) => rewardRef.current?.(n) })
     engine.current = eng
     return () => {
       eng.dispose()
@@ -52,10 +54,10 @@ export function Game({ agent, onExit, onChangeAgent }: { agent: Item; onExit: ()
             </span>
           </div>
           <div className="hud-cds">
-            <div className={`hud-cd ${hud && hud.special <= 0 ? 'ready' : ''}`}>
+            <div className={`hud-cd ${hud && hud.special <= 0 ? 'ready' : ''}`} title={hud?.superName}>
               <i style={{ height: `${spPct}%` }} />
               <b>K</b>
-              <small>{hud && hud.special > 0 ? hud.special.toFixed(1) : 'SPECIAL'}</small>
+              <small title={hud?.superName}>{hud && hud.special > 0 ? hud.special.toFixed(1) : 'SUPER'}</small>
             </div>
             <div className={`hud-cd ${hud && hud.dodge <= 0 ? 'ready' : ''}`}>
               <i style={{ height: `${hud ? (1 - hud.dodge / 0.8) * 100 : 100}%` }} />
@@ -65,12 +67,18 @@ export function Game({ agent, onExit, onChangeAgent }: { agent: Item; onExit: ()
           </div>
         </div>
         <div className="hud-right">
-          <div className="hud-wave">FALA {hud?.wave ?? 1}</div>
+          <div className="hud-wave">POZIOM {hud?.level ?? 1}</div>
+          <div className="hud-stat">
+            Fala <b>{(((hud?.wave ?? 1) - 1) % 3) + 1}/3</b>
+          </div>
           <div className="hud-stat">
             Pokonani <b>{hud?.kills ?? 0}</b>
           </div>
           <div className="hud-stat">
             Wynik <b>{(hud?.score ?? 0).toLocaleString()}</b>
+          </div>
+          <div className="hud-stat coin">
+            Zarobione <b>+{(hud?.earned ?? 0).toLocaleString()} ◈</b>
           </div>
           <div className="hud-stat muted">Wrogowie: {hud?.enemies ?? 0}</div>
         </div>
@@ -79,6 +87,7 @@ export function Game({ agent, onExit, onChangeAgent }: { agent: Item; onExit: ()
         </button>
         {!touch && (
           <div className="game-help">
+            <span><b>Klik</b> złap mysz · <b>Mysz</b>/<b>Q E</b> kamera</span>
             <span><b>WASD</b> ruch</span>
             <span><b>J</b>/<b>LPM</b> atak (combo ×3)</span>
             <span><b>K</b>/<b>PPM</b> specjalny</span>
@@ -93,6 +102,13 @@ export function Game({ agent, onExit, onChangeAgent }: { agent: Item; onExit: ()
         )}
       </div>
 
+      {hud?.boss && !hud.gameOver && (
+        <div className="boss-bar">
+          <span>BOSS</span>
+          <i style={{ width: `${(hud.boss.hp / hud.boss.max) * 100}%` }} />
+        </div>
+      )}
+
       {hud?.banner && !hud.gameOver && (
         <div key={hud.banner} className="game-banner">
           {hud.banner}
@@ -105,7 +121,7 @@ export function Game({ agent, onExit, onChangeAgent }: { agent: Item; onExit: ()
         <div className="game-over">
           <h2>KONIEC GRY</h2>
           <p>
-            Fala <b>{hud.wave}</b> · Pokonani <b>{hud.kills}</b> · Wynik <b>{hud.score.toLocaleString()}</b>
+            Poziom <b>{hud.level}</b> · Fala <b>{hud.wave}</b> · Pokonani <b>{hud.kills}</b> · Wynik <b>{hud.score.toLocaleString()}</b>
           </p>
           <div className="game-over-btns">
             <button className="btn-g primary" onClick={() => engine.current?.restart()}>

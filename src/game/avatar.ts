@@ -1,6 +1,7 @@
 import * as THREE from 'three'
+import type { Flavor, WeaponStyle } from './styles'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
-import { attachOriginalWeapons, createBoneAnimator, detectFacingFlip, hideFarMeshes, hideFloatingWeapons, SpecGlossPlugin, toonifyMaterials, type BoneAnimator } from './rig'
+import { attachOriginalWeapons, hideUnheldWeapons, isWeaponMesh, createBoneAnimator, detectFacingFlip, hideFarMeshes, hideFloatingWeapons, SpecGlossPlugin, toonifyMaterials, type BoneAnimator } from './rig'
 
 /** Shape of public/models/manifest.json (keyed by exact roster name). */
 export interface ModelEntry {
@@ -33,6 +34,8 @@ export function loadManifest(): Promise<Manifest> {
 
 /** Manifest urls are absolute ("/models/..."); respect a non-root Vite base. */
 export function resolveModelUrl(url: string): string {
+  // serwer deweloperski Vite nie znajduje plików z „%26” w ścieżce (np. „Orphie Magnusson & Magus”) — surowy „&” działa wszędzie
+  url = url.replace(/%26/gi, '&')
   const base = import.meta.env.BASE_URL
   if (/^[a-z]+:/i.test(url) || !url.startsWith('/') || base === '/' || url.startsWith(base)) return url
   return base.replace(/\/$/, '') + url
@@ -48,12 +51,19 @@ export interface AvatarState {
   actionT: number
   /** light-attack combo step 0..2 */
   combo: number
+  /** broń dystansowa: atak = celowanie zamiast cięcia; side = ręka ostatniego strzału (1 lewa, -1 prawa) */
+  ranged?: { dual: boolean; side: number }
+  /** styl broni — wybiera animacje ataku i superumiejętności */
+  style?: WeaponStyle
+  flavor?: Flavor
 }
 
 export interface Avatar {
   root: THREE.Object3D
   kind: 'model' | 'placeholder'
   credit?: string
+  /** diagnostyka modelu (rig, broń) */
+  debug?: { rig: boolean; clips: number; armed: boolean; hidden: number; grip?: number[]; fallback?: boolean }
   update(dt: number, s: AvatarState): void
   dispose(): void
 }
@@ -65,7 +75,7 @@ export const TARGET_HEIGHT = 1.8
 const pickClip = (clips: THREE.AnimationClip[], re: RegExp, exclude?: RegExp) =>
   clips.find((c) => re.test(c.name) && !(exclude && exclude.test(c.name)))
 
-export async function loadModelAvatar(entry: ModelEntry, signal: { cancelled: boolean }, accent = '#7cffd4'): Promise<Avatar> {
+export async function loadModelAvatar(entry: ModelEntry, signal: { cancelled: boolean }, accent = '#7cffd4', opts: { name?: string; style?: WeaponStyle } = {}): Promise<Avatar> {
   const loader = new GLTFLoader()
   loader.register((parser) => new SpecGlossPlugin(parser))
   const gltf = await loader.loadAsync(resolveModelUrl(entry.url))
@@ -109,7 +119,7 @@ export async function loadModelAvatar(entry: ModelEntry, signal: { cancelled: bo
   const clips = gltf.animations ?? []
   // brak klipów → animujemy szkielet proceduralnie (jeśli go rozpoznamy)
   const bones = clips.length ? null : createBoneAnimator(model, root)
-  const blade = bones ? attachEnergyBlade(bones, root, model, accent) : null
+  const weapons = bones ? prepareWeapons(bones, root, model, opts.name ?? '', opts.style ?? 'blade', accent) : null
   const mixer = new THREE.AnimationMixer(model)
   const idleClip = pickClip(clips, /idle|stand|wait|breath/i) ?? clips[0]
   const runClip = pickClip(clips, /run|sprint|dash/i) ?? pickClip(clips, /walk|move|jog/i) ?? idleClip
@@ -144,6 +154,7 @@ export async function loadModelAvatar(entry: ModelEntry, signal: { cancelled: bo
   return {
     root,
     kind: 'model',
+    debug: { rig: !!bones, clips: clips.length, armed: weapons?.armed ?? false, hidden: weapons?.hidden ?? 0, grip: weapons?.grip, fallback: weapons?.fallback ?? false },
     credit: entry.author ? `${entry.author}${entry.license ? ` · ${entry.license}` : ''}` : undefined,
     update(dt, st) {
       const attacking = st.action === 'light' || st.action === 'heavy'
@@ -171,13 +182,19 @@ export async function loadModelAvatar(entry: ModelEntry, signal: { cancelled: bo
       let spin = 0
       const b = bones ? 0.35 : 1 // przy animacji kości akcenty całego ciała są subtelniejsze
       pivot.position.y = 0
-      if (st.action === 'light' && !attackClip) {
+      if (st.action === 'light' && !attackClip && !st.ranged) {
         lunge = Math.sin(k * Math.PI) * 0.35
         lean = Math.sin(k * Math.PI) * 0.25 * b
         spin = (k - 0.5) * (st.combo === 1 ? -1.4 : 1.4) * b
       } else if (st.action === 'heavy' && !attackClip) {
-        spin = k * Math.PI * 2
-        lean = Math.sin(k * Math.PI) * 0.2 * b
+        const sty = st.style ?? 'blade'
+        if (sty === 'dual') spin = k * Math.PI * 6
+        else if (sty === 'polearm') spin = Math.min(1, k / 0.7) * Math.PI * 4
+        else if (sty === 'flame') spin = k * Math.PI * 2
+        else if (sty === 'heavy') pivot.position.y = Math.sin(THREE.MathUtils.clamp((k - 0.3) / 0.3, 0, 1) * Math.PI) * 1.6
+        else if (sty === 'blade') lunge = k > 0.3 && k < 0.45 ? 0.6 : 0
+        else if (sty === 'fist') lunge = Math.max(0, Math.sin(k * Math.PI * 16)) * 0.15
+        if (!bones) lean = Math.sin(k * Math.PI) * 0.2
       } else if (st.action === 'dodge') {
         lean = 0.5 * Math.sin(k * Math.PI) * (bones ? 0.5 : 1)
       } else if (!runClip || runClip === idleClip) {
@@ -189,7 +206,6 @@ export async function loadModelAvatar(entry: ModelEntry, signal: { cancelled: bo
       pivot.position.z = lunge
     },
     dispose() {
-      blade?.dispose()
       mixer.stopAllAction()
       mixer.uncacheRoot(model)
       disposeObject(model)
@@ -197,59 +213,143 @@ export async function loadModelAvatar(entry: ModelEntry, signal: { cancelled: bo
   }
 }
 
-/** Przypina oryginalną broń do dłoni; gdy jej nie ma — wkłada w prawą dłoń świecące ostrze w kolorze żywiołu. */
-function attachEnergyBlade(bones: BoneAnimator, root: THREE.Object3D, model: THREE.Object3D, accent: string) {
+/** Przypina oryginalną broń postaci do dłoni i sprząta resztki pozy wystawowej. Nie dokłada żadnej broni. */
+function prepareWeapons(bones: BoneAnimator, root: THREE.Object3D, model: THREE.Object3D, name: string, style: WeaponStyle, accent: string) {
+  // rekwizyty sceny z pozy wystawowej (kokpit Seed itp.)
+  model.traverse((o) => {
+    const m = o as THREE.Mesh
+    if (!m.isMesh) return
+    const mats = Array.isArray(m.material) ? m.material : [m.material]
+    if (mats.some((x) => /cockpit/i.test(x?.name ?? ''))) m.visible = false
+  })
   hideFloatingWeapons(model)
   const armed = attachOriginalWeapons(model, bones.rightHand, bones.leftHand)
-  // poza spoczynkowa → sprzątnięcie „wiszących” resztek i orientacja ostrza względem dłoni
+  // poza spoczynkowa → sprzątnięcie „wiszących” resztek
   const idle: AvatarState = { speed: 0, action: 'none', actionT: 0, combo: 0 }
   for (let i = 0; i < 4; i++) bones.update(1, idle)
   root.updateMatrixWorld(true)
-  const headY = bones.head ? bones.head.getWorldPosition(new THREE.Vector3()).y : TARGET_HEIGHT
-  if (hideFarMeshes(model, root, TARGET_HEIGHT * 0.42, headY + TARGET_HEIGHT * 0.12) > 0) refitVisible(model, root)
-  if (armed) return null // oryginalna broń w dłoni → ostrze energetyczne niepotrzebne
-  const hand = bones.rightHand
-  const handPos = hand.getWorldPosition(new THREE.Vector3())
-  const forePos = bones.rightForearm.getWorldPosition(new THREE.Vector3())
-  // ostrze jako przedłużenie przedramienia, lekko do przodu
-  const dir = handPos.clone().sub(forePos).normalize().add(new THREE.Vector3(0, 0, 0.45)).normalize()
-  const want = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir)
-  const handQ = hand.getWorldQuaternion(new THREE.Quaternion())
-  const handScale = hand.getWorldScale(new THREE.Vector3())
+  // oś postaci = pozycja głowy (środek bounding boxa bywa przesunięty przez rekwizyty z pozy wystawowej)
+  const headW = bones.head ? bones.head.getWorldPosition(new THREE.Vector3()) : null
+  const axis = headW ? headW.clone().applyMatrix4(root.matrixWorld.clone().invert()) : undefined
+  const headY = axis ? axis.y : TARGET_HEIGHT
+  const maxY = bones.inferred ? Infinity : headY + TARGET_HEIGHT * 0.12
+  const hideDist = TARGET_HEIGHT * 0.12 * root.getWorldScale(new THREE.Vector3()).y
+  const hidden = hideUnheldWeapons(model, [bones.rightHand, bones.leftHand], hideDist) + hideFarMeshes(model, root, TARGET_HEIGHT * 0.42, maxY, armed, axis)
+  // zawsze dopasuj do widocznej sylwetki po pozie spoczynkowej (część modeli ma rekwizyty zawyżające wysokość)
+  refitVisible(model, root)
+  let grip = weaponGrip(model, [bones.rightHand, bones.leftHand], root)
+  // brak własnej broni w dłoni → dokładamy broń proceduralną pasującą do stylu
+  const held = grip.some((d) => d <= 0.035) || NATIVE_HELD.has(name)
+  let fallback = false
+  if (!held && !isRanged(style)) {
+    attachFallbackWeapon(style, bones, root, accent)
+    fallback = true
+    grip = weaponGrip(model, [bones.rightHand, bones.leftHand], root)
+  }
+  return { armed: armed || fallback, hidden, grip, fallback }
+}
 
-  const color = new THREE.Color(accent)
-  const glowMat = new THREE.MeshStandardMaterial({ color: 0x000000, emissive: color, emissiveIntensity: 1.5 })
-  const coreMat = new THREE.MeshBasicMaterial({ color: 0xffffff })
-  const haloMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.35, blending: THREE.AdditiveBlending, depthWrite: false })
-  const darkMat = new THREE.MeshStandardMaterial({ color: 0x15131c, roughness: 0.4, metalness: 0.8 })
-  const box = new THREE.BoxGeometry(1, 1, 1)
-  const g = new THREE.Group()
-  const add = (mat: THREE.Material, p: [number, number, number], sc: [number, number, number]) => {
-    const m = new THREE.Mesh(box, mat)
-    m.position.set(...p)
-    m.scale.set(...sc)
-    g.add(m)
+/** Modele, których broń jest częścią innej siatki (nie da się jej wykryć po materiale), a siedzi w dłoni. */
+const NATIVE_HELD = new Set(['Orphie Magnusson & Magus', 'Nekomiya Mana'])
+const isRanged = (s: WeaponStyle) => s === 'gun' || s === 'bow' || s === 'cannon' || s === 'flame'
+
+/**
+ * Proceduralna broń przypięta do kości dłoni. Kształt budujemy wzdłuż +Y od chwytu,
+ * a orientację liczymy w przestrzeni postaci (ostrze do przodu i lekko w dół przy opuszczonej ręce),
+ * po czym przeliczamy ją na lokalny układ dłoni — dzięki temu broń podąża za animacją.
+ */
+function attachFallbackWeapon(style: WeaponStyle, bones: BoneAnimator, root: THREE.Object3D, accent: string) {
+  const metal = new THREE.MeshStandardMaterial({ color: 0xc9d0d8, metalness: 0.85, roughness: 0.25, name: 'fallback_Weapon' })
+  const dark = new THREE.MeshStandardMaterial({ color: 0x24222a, metalness: 0.4, roughness: 0.6, name: 'fallback_Weapon_grip' })
+  const glow = new THREE.MeshStandardMaterial({ color: accent, emissive: accent, emissiveIntensity: 1.6, name: 'fallback_Weapon_glow' })
+  const part = (geo: THREE.BufferGeometry, mat: THREE.Material, y: number, x = 0, z = 0) => {
+    const m = new THREE.Mesh(geo, mat)
+    m.position.set(x, y, z)
+    m.castShadow = true
+    m.name = 'FallbackWeapon_part'
     return m
   }
-  add(darkMat, [0, 0, -0.02], [0.035, 0.035, 0.16]) // rękojeść
-  add(darkMat, [0, 0, 0.07], [0.12, 0.03, 0.03]) // jelec
-  add(glowMat, [0, 0, 0.5], [0.05, 0.012, 0.82]) // ostrze
-  add(coreMat, [0, 0, 0.5], [0.01, 0.014, 0.74])
-  add(haloMat, [0, 0, 0.5], [0.11, 0.05, 0.9])
-
-  g.quaternion.copy(handQ.invert().multiply(want))
-  g.scale.set(1 / handScale.x, 1 / handScale.y, 1 / handScale.z)
-  hand.add(g)
-  return {
-    dispose() {
-      hand.remove(g)
-      box.dispose()
-      glowMat.dispose()
-      coreMat.dispose()
-      haloMat.dispose()
-      darkMat.dispose()
-    },
+  const make = (kind: 'sword' | 'dagger' | 'hammer' | 'spear' | 'gauntlet') => {
+    const g = new THREE.Group()
+    g.name = 'FallbackWeapon'
+    if (kind === 'sword') {
+      g.add(part(new THREE.CylinderGeometry(0.018, 0.02, 0.22, 8), dark, -0.04))
+      g.add(part(new THREE.BoxGeometry(0.12, 0.02, 0.04), dark, 0.075))
+      g.add(part(new THREE.BoxGeometry(0.035, 0.82, 0.008), metal, 0.5))
+      g.add(part(new THREE.BoxGeometry(0.008, 0.78, 0.01), glow, 0.49, 0.019))
+    } else if (kind === 'dagger') {
+      g.add(part(new THREE.CylinderGeometry(0.016, 0.018, 0.13, 8), dark, 0))
+      g.add(part(new THREE.BoxGeometry(0.08, 0.015, 0.03), dark, 0.07))
+      g.add(part(new THREE.BoxGeometry(0.03, 0.38, 0.007), metal, 0.27))
+      g.add(part(new THREE.BoxGeometry(0.006, 0.34, 0.009), glow, 0.27, 0.016))
+    } else if (kind === 'hammer') {
+      g.add(part(new THREE.CylinderGeometry(0.025, 0.028, 1.0, 8), dark, 0.25))
+      g.add(part(new THREE.BoxGeometry(0.34, 0.2, 0.2), metal, 0.78))
+      g.add(part(new THREE.BoxGeometry(0.36, 0.04, 0.21), glow, 0.78))
+    } else if (kind === 'spear') {
+      g.add(part(new THREE.CylinderGeometry(0.02, 0.02, 1.9, 8), dark, 0.35))
+      g.add(part(new THREE.ConeGeometry(0.05, 0.34, 4), metal, 1.47))
+      g.add(part(new THREE.TorusGeometry(0.035, 0.01, 6, 12), glow, 1.28))
+    } else {
+      g.add(part(new THREE.BoxGeometry(0.11, 0.12, 0.13), dark, 0.04))
+      g.add(part(new THREE.BoxGeometry(0.115, 0.03, 0.04), glow, 0.06, 0, 0.06))
+    }
+    return g
   }
+
+  root.updateMatrixWorld(true)
+  const rootQ = root.getWorldQuaternion(new THREE.Quaternion())
+  const mount = (hand: THREE.Object3D, kind: Parameters<typeof make>[0], dirLocal: THREE.Vector3) => {
+    const w = make(kind)
+    const handPos = hand.getWorldPosition(new THREE.Vector3())
+    const fore = hand.parent ?? hand
+    const forePos = fore.getWorldPosition(new THREE.Vector3())
+    // dłoń: kawałek za kością nadgarstka, w kierunku przedramię→dłoń
+    const along = handPos.clone().sub(forePos)
+    const len = along.length()
+    const palm = handPos.clone().add(len > 1e-6 ? along.multiplyScalar(0.28) : new THREE.Vector3())
+    // orientacja: +Y broni → dirLocal (w przestrzeni postaci)
+    const want = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), dirLocal.clone().normalize())
+    const worldQ = rootQ.clone().multiply(want)
+    const handQ = hand.getWorldQuaternion(new THREE.Quaternion())
+    const s = hand.getWorldScale(new THREE.Vector3()).x || 1
+    const rs = root.getWorldScale(new THREE.Vector3()).x || 1
+    hand.add(w)
+    w.position.copy(hand.worldToLocal(palm))
+    w.quaternion.copy(handQ.invert().multiply(worldQ))
+    w.scale.setScalar(rs / s)
+  }
+  const fwdDown = new THREE.Vector3(0, -0.35, 1)
+  if (style === 'dual') {
+    mount(bones.rightHand, 'dagger', fwdDown)
+    mount(bones.leftHand, 'dagger', fwdDown)
+  } else if (style === 'heavy') mount(bones.rightHand, 'hammer', new THREE.Vector3(0, 0.25, 1))
+  else if (style === 'polearm') mount(bones.rightHand, 'spear', new THREE.Vector3(0, 1, 0.35))
+  else if (style === 'fist') {
+    mount(bones.rightHand, 'gauntlet', new THREE.Vector3(0, -1, 0))
+    mount(bones.leftHand, 'gauntlet', new THREE.Vector3(0, -1, 0))
+  } else mount(bones.rightHand, 'sword', fwdDown)
+}
+
+/** Diagnostyka: dla każdej widocznej siatki broni — odległość (w jednostkach wysokości postaci) jej najbliższego punktu od dłoni. */
+function weaponGrip(model: THREE.Object3D, hands: THREE.Object3D[], root: THREE.Object3D) {
+  root.updateMatrixWorld(true)
+  const sc = root.getWorldScale(new THREE.Vector3()).y * TARGET_HEIGHT
+  const hp = hands.map((h) => h.getWorldPosition(new THREE.Vector3()))
+  const box = new THREE.Box3()
+  const c = new THREE.Vector3()
+  const out: number[] = []
+  model.traverse((o) => {
+    const m = o as THREE.SkinnedMesh
+    if (!m.isMesh || !m.visible || !isWeaponMesh(m)) return
+    if (m.isSkinnedMesh) m.computeBoundingBox()
+    else if (!m.geometry.boundingBox) m.geometry.computeBoundingBox()
+    const bb = m.isSkinnedMesh ? m.boundingBox : m.geometry.boundingBox
+    if (!bb || bb.isEmpty()) return
+    box.copy(bb).applyMatrix4(m.matrixWorld)
+    out.push(+(Math.min(...hp.map((p) => box.clampPoint(p, c).distanceTo(p))) / sc).toFixed(3))
+  })
+  return out
 }
 
 /** Po ukryciu części modelu: ponownie skaluje do TARGET_HEIGHT i stawia stopy na ziemi (wg widocznych siatek). */
@@ -261,7 +361,7 @@ function refitVisible(model: THREE.Object3D, root: THREE.Object3D) {
     const tmp = new THREE.Box3()
     model.traverse((o) => {
       const m = o as THREE.SkinnedMesh
-      if (!m.isMesh || !m.visible) return
+      if (!m.isMesh || !m.visible || isWeaponMesh(m)) return // broń (np. unoszące się drony) nie wlicza się do wzrostu
       if (m.isSkinnedMesh) m.computeBoundingBox()
       else if (!m.geometry.boundingBox) m.geometry.computeBoundingBox()
       const bb = m.isSkinnedMesh ? m.boundingBox : m.geometry.boundingBox

@@ -1,8 +1,10 @@
 import { AnimatePresence, motion } from 'motion/react'
 import { useEffect, useMemo, useState } from 'react'
-import { RANK_COLOR } from '../data/roster'
+import { ELEMENT_COLORS, RANK_COLOR } from '../data/roster'
+import { loadManifest, loadModelAvatar, type Avatar } from '../game/avatar'
 import { rankValue, type PullResult } from '../lib/gacha'
 import { sfx } from '../lib/sfx'
+import { HeroReveal } from '../three/HeroReveal'
 import { WarpScene } from '../three/WarpScene'
 import { Portrait } from './Portrait'
 import { ResultCard } from './ResultCard'
@@ -22,6 +24,9 @@ export function PullSequence({ results, onClose }: { results: PullResult[]; onCl
   useEffect(() => {
     sfx.warp()
   }, [])
+
+  // modele 3D agentów ładują się w tle już podczas warpu
+  const heroes = useHeroModels(reveals)
 
   const toFlash = () => {
     if (phase !== 'warp') return
@@ -76,7 +81,7 @@ export function PullSequence({ results, onClose }: { results: PullResult[]; onCl
       </AnimatePresence>
 
       <AnimatePresence mode="wait">
-        {phase === 'reveal' && reveals[idx] && <Splash key={idx} r={reveals[idx]} />}
+        {phase === 'reveal' && reveals[idx] && <Splash key={idx} r={reveals[idx]} hero={heroes[idx]} />}
       </AnimatePresence>
 
       {phase === 'summary' && <Summary results={results} onClose={onClose} />}
@@ -91,32 +96,81 @@ export function PullSequence({ results, onClose }: { results: PullResult[]; onCl
   )
 }
 
-function Splash({ r }: { r: PullResult }) {
+/** Startuje ładowanie modeli 3D dla agentów z listy (indeks → avatar albo null, gdy brak modelu). */
+function useHeroModels(reveals: PullResult[]) {
+  const [heroes, setHeroes] = useState<Record<number, Promise<Avatar | null>>>({})
+  useEffect(() => {
+    const signal = { cancelled: false }
+    const map: Record<number, Promise<Avatar | null>> = {}
+    reveals.forEach((r, i) => {
+      const { item } = r
+      if (item.kind !== 'agent') return
+      const accent = item.element ? ELEMENT_COLORS[item.element][0] : RANK_COLOR[item.rank]
+      map[i] = loadManifest()
+        .then((m) => (m[item.name] ? loadModelAvatar(m[item.name], signal, accent) : null))
+        .catch(() => null)
+    })
+    setHeroes(map)
+    return () => {
+      signal.cancelled = true
+      for (const p of Object.values(map)) void p.then((a) => a?.dispose())
+    }
+  }, [reveals])
+  return heroes
+}
+
+const HERO_TIMEOUT_MS = 6000
+
+function Splash({ r, hero }: { r: PullResult; hero?: Promise<Avatar | null> }) {
   const { item } = r
   const color = RANK_COLOR[item.rank]
   const isS = item.rank === 'S'
+  const [avatar, setAvatar] = useState<Avatar | null>(null)
+  const [mode, setMode] = useState<'wait' | '3d' | '2d'>(hero ? 'wait' : '2d')
+  const [peak, setPeak] = useState(false)
+  const showText = mode === '2d' || (mode === '3d' && peak)
 
   useEffect(() => {
-    sfx.reveal(rankValue(item.rank))
-  }, [item.rank])
+    if (!hero) return
+    let live = true
+    const timer = setTimeout(() => live && setMode((m) => (m === 'wait' ? '2d' : m)), HERO_TIMEOUT_MS)
+    void hero.then((a) => {
+      if (!live) return
+      if (a) setAvatar(a)
+      setMode((m) => (m === 'wait' ? (a ? '3d' : '2d') : m))
+    })
+    return () => {
+      live = false
+      clearTimeout(timer)
+    }
+  }, [hero])
+
+  useEffect(() => {
+    if (showText) sfx.reveal(rankValue(item.rank))
+  }, [showText, item.rank])
 
   return (
     <motion.div
-      className={`splash rank-${item.rank}`}
+      className={`splash rank-${item.rank}${mode === '3d' ? ' is-3d' : ''}`}
       style={{ ['--rc' as string]: color }}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0, x: -80, filter: 'blur(8px)' }}
       transition={{ duration: 0.3 }}
     >
-      <motion.div
-        className="splash-stripes"
-        initial={{ x: '-100%' }}
-        animate={{ x: '0%' }}
-        transition={{ duration: 0.5, ease: [0.2, 0.9, 0.2, 1] }}
-      />
-      {isS && <Sparks color={color} />}
+      {mode === '3d' && avatar && <HeroReveal item={item} avatar={avatar} onPeak={() => setPeak(true)} />}
+      {mode !== '3d' && (
+        <motion.div
+          className="splash-stripes"
+          initial={{ x: '-100%' }}
+          animate={{ x: '0%' }}
+          transition={{ duration: 0.5, ease: [0.2, 0.9, 0.2, 1] }}
+        />
+      )}
+      {mode === 'wait' && <div className="hero-wait">decoding signal</div>}
+      {isS && mode === '2d' && <Sparks color={color} />}
 
+      {mode === '2d' && (
       <motion.div
         className="splash-art"
         initial={{ x: 300, opacity: 0, skewX: -12, scale: 1.2 }}
@@ -126,7 +180,9 @@ function Splash({ r }: { r: PullResult }) {
         <Portrait item={item} className="big" />
         <div className="art-glow" />
       </motion.div>
+      )}
 
+      {showText && (
       <div className="splash-text">
         <motion.div
           className="rank-stamp"
@@ -161,6 +217,7 @@ function Splash({ r }: { r: PullResult }) {
           </motion.blockquote>
         )}
       </div>
+      )}
       <div className="tap-hint">tap to continue</div>
     </motion.div>
   )

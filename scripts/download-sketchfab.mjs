@@ -7,7 +7,7 @@
 // Już pobrane foldery są pomijane, więc można odpalać ponownie.
 // Wymaga Node 20+ (globalny fetch) i systemowego `unzip`.
 
-import { mkdir, writeFile, readdir, rm, rename, stat, mkdtemp, cp } from 'node:fs/promises'
+import { mkdir, writeFile, readFile, readdir, rm, rename, stat, mkdtemp, cp } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import os from 'node:os'
@@ -37,6 +37,14 @@ const ALIASES = {
 
 // Modele spoza kolekcji (wyszukane ręcznie na Sketchfabie) — nazwa z rosteru → UID.
 // Używane tylko dla agentów, których kolekcja nie pokrywa.
+// Nadpisania: modele z kolekcji, które są wadliwe — te UID-y wygrywają z dopasowaniem z kolekcji.
+//  Alice Thymefield — „Alice 2 zzz” nie ma szkieletu (statyczna T-poza)
+//  Soldier 11 — „Soldier 11 ZZZ” to w środku model Soldier 0 - Anby
+const OVERRIDE_MODELS = {
+  'Alice Thymefield': '9384c55c95ef4e37a5afb705e3db9d54',
+  'Soldier 11': '51f013bf3b694bd8b2cf3dc838ecdbd8',
+}
+
 const EXTRA_MODELS = {
   Aria: '131bff1cd85644bfbd6591f41efbc070',
   Banyue: 'c18b842685f643b59a41dc5eedd79a5e',
@@ -153,7 +161,14 @@ const KEEP = ['*.gltf', '*.glb', '*.bin', '*.png', '*.jpg', '*.jpeg', '*.webp', 
 
 async function download(name, m) {
   const dest = path.join(AGENTS_DIR, name)
-  if (existsSync(dest)) return console.log(`  ⏭  ${name} — już jest`)
+  if (existsSync(dest)) {
+    // .uid = z którego modelu Sketchfab pochodzi folder; inny wybór (np. nadpisanie) → pobieramy od nowa
+    const marker = path.join(dest, '.uid')
+    const have = existsSync(marker) ? (await readFile(marker, 'utf8')).trim() : OVERRIDE_MODELS[name] ? 'stary' : m.uid
+    if (have === m.uid) return console.log(`  ⏭  ${name} — już jest`)
+    console.log(`  ↻ ${name} — zmiana modelu, pobieram ponownie`)
+    await rm(dest, { recursive: true, force: true })
+  }
   const info = await getJson(`${API}/models/${m.uid}/download`, { Authorization: `Token ${TOKEN}` })
   const url = info.gltf?.url
   if (!url) return console.log(`  ✗ ${name} — brak wersji glTF do pobrania`)
@@ -182,6 +197,7 @@ async function download(name, m) {
     } catch {
       await cp(src, dest, { recursive: true })
     }
+    await writeFile(path.join(dest, '.uid'), m.uid + '\n')
     console.log(`  ✓ ${name} (${(await dirSize(dest) / 1e6).toFixed(1)} MB)`)
   } finally {
     await rm(tmp, { recursive: true, force: true })
@@ -223,8 +239,8 @@ for (const m of models) {
 }
 const chosen = new Map()
 for (const [r, list] of candidates) chosen.set(r, list.sort((a, b) => score(b) - score(a))[0])
-for (const [r, uid] of Object.entries(EXTRA_MODELS)) {
-  if (chosen.has(r) || !roster.includes(r)) continue
+for (const [r, uid] of [...Object.entries(OVERRIDE_MODELS), ...Object.entries(EXTRA_MODELS)]) {
+  if (!roster.includes(r) || (chosen.has(r) && !(r in OVERRIDE_MODELS)) || chosen.get(r)?.uid === uid) continue
   try {
     chosen.set(r, await getJson(`${API}/models/${uid}`))
   } catch (e) {

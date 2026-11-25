@@ -9,6 +9,9 @@
 // ─────────────────────────────────────────────────────────────
 
 import * as THREE from 'three'
+import { attackPose } from './attackPoses'
+import type { Flavor } from './styles'
+const DEFAULT_FLAVOR: Flavor = { tempo: 1, mirror: 1, flair: 0.5, stance: 0.5 }
 import type { GLTFLoaderPlugin, GLTFParser } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import type { AvatarState } from './avatar'
 
@@ -88,11 +91,18 @@ export function hideFloatingWeapons(model: THREE.Object3D): number {
 }
 
 /**
- * Przypina oryginalne bronie do dłoni. W modelach „UI” kości Bip001 Prop1/Prop2
- * (dzieci dłoni) są odsunięte do pozy wystawowej — zerujemy je, żeby broń trafiła do ręki.
- * Kości broni wiszące na korzeniu szkieletu (np. katana) przepinamy do prawej dłoni.
+ * Przypina oryginalne bronie do dłoni. W modelach „UI” kości Bip001 Prop1 (prawa dłoń) i Prop2 (lewa)
+ * często wiszą na korzeniu szkieletu albo miednicy, w pozie wystawowej — przepinamy je do dłoni i zerujemy.
+ * Luźne korzenie broni („Xxx_Weapon”, „Weapon_L01”, „Ctr_Wpn…” na korzeniu) trafiają do dłoni po stronie
+ * wskazanej nazwą (L → lewa), a gdy dłoń ma już Prop — do niego.
  * Zwraca true, jeśli postać ma widoczną broń w ręce.
  */
+let KEEP_GRIP = false
+/** tylko do diagnostyki: zostaw oryginalny chwyt Propów, które już są w dłoni */
+export function setKeepGrip(v: boolean) {
+  KEEP_GRIP = v
+}
+
 export function attachOriginalWeapons(model: THREE.Object3D, rHand: THREE.Object3D, lHand: THREE.Object3D): boolean {
   const isHand = (o: THREE.Object3D | null) => o === rHand || o === lHand
   const underHand = (o: THREE.Object3D) => {
@@ -100,46 +110,89 @@ export function attachOriginalWeapons(model: THREE.Object3D, rHand: THREE.Object
     return false
   }
   const WEAPON_BONE = /weapon|wpn|wepon|katana|sword|blade|hilt/i
-  const props: THREE.Object3D[] = []
+  // kości ciała, pod którymi broń jest „noszona” (plecy, udo…), a nie wystawiona
+  const BODY = /bip00\d (spine|neck|head|l |r |pelvis)/
+  const bodyAncestor = (o: THREE.Object3D) => {
+    for (let p = o.parent; p; p = p.parent) {
+      const n = normName(p.name)
+      if (BODY.test(n) && !/pelvis/.test(n)) return true
+    }
+    return false
+  }
+
+  const props: { bone: THREE.Object3D; hand: THREE.Object3D }[] = []
   const loose: THREE.Object3D[] = []
   model.traverse((o) => {
     const n = normName(o.name)
-    if ((/^bip001 prop[12]$/.test(n) || /(^|_)(bow|wpn|weapon|wepon)/i.test(o.name)) && isHand(o.parent)) props.push(o)
-    else if (WEAPON_BONE.test(o.name) && !(o as THREE.Mesh).isMesh && !underHand(o)) {
-      // tylko najwyższa kość broni w gałęzi, wisząca na korzeniu (nie na kręgosłupie — to np. kołczan)
-      const parentName = normName(o.parent?.name ?? '')
-      if (!WEAPON_BONE.test(o.parent?.name ?? '') && /^(bip001|rootjoint|bip001 pelvis)$/.test(parentName.replace(/^_/, ''))) loose.push(o)
-    }
+    if ((o as THREE.Mesh).isMesh) return
+    if (/^bip00\d prop1$/.test(n)) props.push({ bone: o, hand: rHand })
+    else if (/^bip00\d prop2$/.test(n)) props.push({ bone: o, hand: lHand })
+    else if (/(^|_)(bow|wpn|weapon|wepon)/i.test(o.name) && isHand(o.parent)) props.push({ bone: o, hand: o.parent! })
+    else if (WEAPON_BONE.test(o.name) && !underHand(o) && !WEAPON_BONE.test(o.parent?.name ?? '') && !bodyAncestor(o) && !/fx|eff/i.test(o.name)) loose.push(o)
   })
-  for (const p of props) {
-    p.position.set(0, 0, 0)
-    p.quaternion.identity()
-  }
-  // luźne bronie — tylko jeśli prawa dłoń nie ma już broni z Prop1
-  const rightHasProp = props.some((p) => p.parent === rHand && p.children.length > 0)
-  if (!rightHasProp) {
-    for (const b of loose) {
-      rHand.add(b)
-      b.position.set(0, 0, 0)
-      b.quaternion.identity()
-      b.scale.set(1, 1, 1)
+  model.updateMatrixWorld(true)
+  const wp = (o: THREE.Object3D) => o.getWorldPosition(new THREE.Vector3())
+  for (const { bone, hand } of props) {
+    // Prop już w dłoni i tuż przy niej = poprawny chwyt z modelu (zostawiamy obrót);
+    // inaczej (na korzeniu/miednicy albo odsunięty) — przepinamy i zerujemy
+    const forearm = hand.parent ?? hand
+    const armLen = wp(hand).distanceTo(wp(forearm)) || 1
+    if (KEEP_GRIP && bone.parent === hand && wp(bone).distanceTo(wp(hand)) < armLen * 0.25) continue
+    if (bone.parent !== hand) hand.add(bone)
+    bone.position.set(0, 0, 0)
+    bone.quaternion.identity()
+    // korzeń broni pod Propem bywa sam odsunięty w pozie wystawowej (np. karabin Zhu Yuan) — też do dłoni
+    const handLen = hand.position.length() || armLen
+    for (const c of bone.children) {
+      if ((c as THREE.Mesh).isMesh || c.position.length() < handLen * 1.5) continue
+      c.position.set(0, 0, 0)
     }
   }
-  // czy jakakolwiek widoczna siatka broni jest teraz związana z dłonią?
-  let armed = false
+  const propOf = (hand: THREE.Object3D) => props.find((p) => p.hand === hand)?.bone
+  const filled = new Set(props.filter((p) => hasWeaponMesh(model, p.bone)).map((p) => p.hand))
+  for (const b of loose) {
+    const left = /(^|[_\s])l(\d|[_\s]|$)|left/i.test(b.name)
+    const hand = left ? lHand : rHand
+    if (filled.has(hand) && !hasWeaponMesh(model, b)) continue
+    const target = propOf(hand) ?? hand
+    target.add(b)
+    b.position.set(0, 0, 0)
+    b.quaternion.identity()
+    b.scale.set(1, 1, 1)
+  }
+  return hasWeaponMesh(model, rHand) || hasWeaponMesh(model, lHand)
+}
+
+/** Czy jakaś widoczna siatka broni jest związana z kośćmi pod `node` (albo jest jego dzieckiem)? */
+function hasWeaponMesh(model: THREE.Object3D, node: THREE.Object3D) {
+  const under = (o: THREE.Object3D) => {
+    for (let p: THREE.Object3D | null = o; p; p = p.parent) if (p === node) return true
+    return false
+  }
+  let found = false
   model.traverse((o) => {
     const m = o as THREE.SkinnedMesh
-    if (!m.isSkinnedMesh || !m.visible) return
-    const mats = Array.isArray(m.material) ? m.material : [m.material]
-    if (!mats.some((x) => /weapon|wpn|wepon/i.test(x?.name ?? ''))) return
-    if (m.skeleton.bones.some((b) => underHand(b) && b.name && WEAPON_BONE.test(b.name + (b.parent?.name ?? '')))) armed = true
-    else if (m.skeleton.bones.some((b) => /prop[12]/i.test(b.name) && isHand(b.parent))) armed = armed || props.length > 0
+    if (found || !m.isMesh || !m.visible) return
+    if (m.isSkinnedMesh) {
+      if (m.skeleton.bones.some((b) => b !== node && under(b)) && (isWeaponMesh(m) || meshMostlyUnder(m, under))) found = true
+    } else if (under(m)) found = true
   })
-  return armed || props.some((p) => p.children.length > 0)
+  return found
+}
+
+/** Siatka bez nazwanego materiału broni (np. MMD) — liczy się, jeśli większość jej kości jest pod węzłem. */
+function meshMostlyUnder(m: THREE.SkinnedMesh, under: (o: THREE.Object3D) => boolean) {
+  const bones = m.skeleton.bones
+  return bones.length > 0 && bones.filter(under).length / bones.length > 0.6
+}
+
+export function isWeaponMesh(m: THREE.Mesh) {
+  const mats = Array.isArray(m.material) ? m.material : [m.material]
+  return mats.some((x) => /weapon|wpn|wepon/i.test(x?.name ?? '')) || /weapon|wpn|wepon/i.test(m.name)
 }
 
 /** Chowa siatki, których środek jest daleko od osi postaci (resztki pozy wystawowej). */
-export function hideFarMeshes(model: THREE.Object3D, root: THREE.Object3D, maxDist: number, maxY = Infinity) {
+export function hideFarMeshes(model: THREE.Object3D, root: THREE.Object3D, maxDist: number, maxY = Infinity, keepWeapons = false, axis?: THREE.Vector3) {
   root.updateMatrixWorld(true)
   const inv = root.matrixWorld.clone().invert()
   const box = new THREE.Box3()
@@ -148,13 +201,14 @@ export function hideFarMeshes(model: THREE.Object3D, root: THREE.Object3D, maxDi
   model.traverse((o) => {
     const m = o as THREE.SkinnedMesh
     if (!m.isMesh || !m.visible) return
+    if (keepWeapons && isWeaponMesh(m)) return
     if (m.isSkinnedMesh) m.computeBoundingBox()
     else if (!m.geometry.boundingBox) m.geometry.computeBoundingBox()
     const bb = m.isSkinnedMesh ? m.boundingBox : m.geometry.boundingBox
     if (!bb || bb.isEmpty()) return
     box.copy(bb).applyMatrix4(m.matrixWorld).applyMatrix4(inv)
     box.getCenter(c)
-    if (Math.hypot(c.x, c.z) > maxDist || c.y > maxY) {
+    if (Math.hypot(c.x - (axis?.x ?? 0), c.z - (axis?.z ?? 0)) > maxDist || c.y > maxY) {
       m.visible = false
       hidden++
     }
@@ -186,12 +240,16 @@ const BONES = {
 type BoneKey = keyof typeof BONES
 
 // „Bip001_L_UpperArm_074” → „bip001 l upperarm”
+// „ValveBiped.Bip01_L_UpperArm_102” → „bip001 l upperarm” (szkielet Source/SFM)
 const normName = (n: string) =>
   n
     .replace(/_\d+$/, '')
+    .replace(/^valvebiped\.?bip01/i, 'Bip001')
     .replace(/[\s_]+/g, ' ')
     .trim()
     .toLowerCase()
+    .replace(/^bip001 (neck|head)1$/, 'bip001 $1')
+    .replace(/^bip001 spine4$/, 'bip001 spine2')
 
 interface RigBone {
   bone: THREE.Object3D
@@ -200,6 +258,8 @@ interface RigBone {
   restWorldInv: THREE.Quaternion
   /** kierunek kości w pozie spoczynkowej (do następnego stawu) w przestrzeni postaci */
   dir: THREE.Vector3
+  /** bliźniaki obracane tak samo (MMD: łańcuchy D) */
+  extra?: RigBone[]
 }
 
 const AX = new THREE.Vector3(1, 0, 0)
@@ -216,6 +276,7 @@ const axisAngle = (out: THREE.Quaternion, axis: THREE.Vector3, a: number) => out
 function applyRot(b: RigBone, R: THREE.Quaternion) {
   _q.copy(b.restWorldInv).multiply(R).multiply(b.restWorld)
   b.bone.quaternion.copy(b.restLocal).multiply(_q)
+  if (b.extra) for (const e of b.extra) applyRot(e, R)
 }
 
 /** płynnie dążące parametry pozy */
@@ -237,6 +298,8 @@ export interface BoneAnimator {
   leftHand: THREE.Object3D
   head: THREE.Object3D | null
   rightForearm: THREE.Object3D
+  /** szkielet rozpoznany z kształtu (bez nazw kości) — mniej pewna głowa/rekwizyty */
+  inferred: boolean
 }
 
 /**
@@ -245,7 +308,9 @@ export interface BoneAnimator {
  * Zwraca też `facingFlip` — true, gdy model patrzy w -Z (trzeba go obrócić o 180°).
  */
 export function detectFacingFlip(model: THREE.Object3D): boolean {
-  const found = findBones(model)
+  const res = resolveBones(model)
+  if (res.flip !== undefined) return res.flip
+  const found = res.found
   if (!found.lUpper || !found.rUpper) return false
   model.updateMatrixWorld(true)
   const l = found.lUpper.getWorldPosition(new THREE.Vector3())
@@ -265,10 +330,185 @@ function findBones(model: THREE.Object3D) {
   return found
 }
 
-export function createBoneAnimator(model: THREE.Object3D, reference: THREE.Object3D): BoneAnimator | null {
+const REQUIRED: BoneKey[] = ['spine', 'lUpper', 'lFore', 'lHand', 'rUpper', 'rFore', 'rHand', 'lThigh', 'lCalf', 'lFoot', 'rThigh', 'rCalf', 'rFoot']
+
+interface Resolved {
+  found: Partial<Record<BoneKey, THREE.Object3D>>
+  /** kości-bliźniaki (np. MMD „足D”) — w tej samej pozycji, obracane razem z główną */
+  twins: Map<THREE.Object3D, THREE.Object3D[]>
+  /** tylko dla szkieletów rozpoznanych z kształtu: czy model patrzy w -Z */
+  flip?: boolean
+}
+
+/** Najpierw po nazwach (Bip001/ValveBiped), a gdy ich brak — z kształtu szkieletu (MMD z utraconymi nazwami). */
+export function resolveBones(model: THREE.Object3D): Resolved {
   const found = findBones(model)
-  const required: BoneKey[] = ['spine', 'lUpper', 'lFore', 'lHand', 'rUpper', 'rFore', 'rHand', 'lThigh', 'lCalf', 'lFoot', 'rThigh', 'rCalf', 'rFoot']
-  if (required.some((k) => !found[k])) return null
+  if (REQUIRED.every((k) => found[k])) return { found, twins: new Map() }
+  return inferBones(model) ?? { found, twins: new Map() }
+}
+
+/**
+ * Rozpoznaje kończyny po geometrii szkieletu:
+ *  nogi — łańcuch od stopy (nisko) przez kolano do biodra,
+ *  dłonie — kość z ≥3 „palcami” (dziećmi, które mają własne dzieci), z dala od osi,
+ *  kręgosłup — droga od wspólnego przodka ramion do wspólnego przodka z nogami.
+ */
+function inferBones(model: THREE.Object3D): Resolved | null {
+  model.updateMatrixWorld(true)
+  const bones: THREE.Object3D[] = []
+  model.traverse((o) => {
+    if ((o as THREE.Bone).isBone) bones.push(o)
+  })
+  if (bones.length < 15) return null
+  const isBone = new Set(bones)
+  const P = new Map<THREE.Object3D, THREE.Vector3>()
+  for (const b of bones) P.set(b, b.getWorldPosition(new THREE.Vector3()))
+  let minY = Infinity
+  let maxY = -Infinity
+  let cx = 0
+  let cz = 0
+  for (const p of P.values()) {
+    minY = Math.min(minY, p.y)
+    maxY = Math.max(maxY, p.y)
+    cx += p.x
+    cz += p.z
+  }
+  cx /= bones.length
+  cz /= bones.length
+  const H = maxY - minY
+  if (!(H > 1e-6)) return null
+  const yN = (b: THREE.Object3D) => (P.get(b)!.y - minY) / H
+  const hor = (b: THREE.Object3D) => Math.hypot(P.get(b)!.x - cx, P.get(b)!.z - cz) / H
+  const dist = (a: THREE.Object3D, b: THREE.Object3D) => P.get(a)!.distanceTo(P.get(b)!) / H
+  const parentBone = (b: THREE.Object3D) => (b.parent && isBone.has(b.parent) ? b.parent : null)
+  const ancestors = (b: THREE.Object3D) => {
+    const out: THREE.Object3D[] = []
+    for (let p = parentBone(b); p; p = parentBone(p)) out.push(p)
+    return out
+  }
+
+  // ── nogi ──
+  type Leg = { thigh: THREE.Object3D; calf: THREE.Object3D; foot: THREE.Object3D }
+  const legs: Leg[] = []
+  for (const tip of bones) {
+    if (yN(tip) > 0.16) continue
+    const up = [tip, ...ancestors(tip)]
+    const ci = up.findIndex((a) => yN(a) > yN(tip) + 0.12)
+    if (ci < 1) continue
+    const calf = up[ci]
+    const foot = up[ci - 1]
+    const ti = up.findIndex((a, i) => i > ci && yN(a) > yN(calf) + 0.12)
+    if (ti < 0) continue
+    const thigh = up[ti]
+    if (yN(thigh) < 0.35 || yN(thigh) > 0.72 || yN(calf) < 0.12 || yN(calf) > 0.45 || hor(thigh) > 0.2) continue
+    if (Math.abs(P.get(calf)!.x - P.get(thigh)!.x) / H > 0.12) continue
+    if (!legs.some((l) => l.thigh === thigh && l.calf === calf && l.foot === foot)) legs.push({ thigh, calf, foot })
+  }
+  if (legs.length < 2) return null
+
+  // kierunek „przodu” — palce stóp wystają do przodu
+  let fwd = 0
+  for (const l of legs)
+    for (const c of l.foot.children) if (isBone.has(c)) fwd += P.get(c)!.z - P.get(l.foot)!.z
+  const F = fwd < 0 ? -1 : 1
+  // oś ciała = środek między biodrami (średnia wszystkich kości bywa przesunięta przez włosy/uszy/rekwizyty)
+  const hx = legs.reduce((a, l) => a + P.get(l.thigh)!.x, 0) / legs.length
+  // lewa strona postaci patrzącej w +Z leży po +X
+  const sideOf = (b: THREE.Object3D) => Math.sign((P.get(b)!.x - hx) * F)
+  const lat = (b: THREE.Object3D) => Math.abs(P.get(b)!.x - hx) / H
+
+  // ── dłonie ──
+  const hasKids = (b: THREE.Object3D) => b.children.some((c) => isBone.has(c))
+  type Arm = { upper: THREE.Object3D; fore: THREE.Object3D; hand: THREE.Object3D }
+  const arms: Arm[] = []
+  for (const hand of bones) {
+    const fingers = hand.children.filter((c) => isBone.has(c) && hasKids(c))
+    if (fingers.length < 3 || yN(hand) < 0.3 || lat(hand) < 0.08) continue
+    const up = ancestors(hand)
+    const fi = up.findIndex((a) => dist(a, hand) > 0.09)
+    if (fi < 0) continue
+    const fore = up[fi]
+    const ui = up.findIndex((a, i) => i > fi && dist(a, fore) > 0.09)
+    if (ui < 0) continue
+    const upper = up[ui]
+    if (yN(upper) < 0.6 || yN(upper) > 0.92) continue
+    // dłoń wisi nie wyżej niż bark i dalej od osi niż ramię, po tej samej stronie
+    if (yN(hand) > yN(upper) + 0.03 || lat(hand) < lat(upper) || sideOf(hand) !== sideOf(upper)) continue
+    arms.push({ upper, fore, hand })
+  }
+
+  const pick = <T extends { [k: string]: THREE.Object3D }>(list: T[], side: number, first: keyof T) => {
+    const mine = list.filter((x) => sideOf(x[first]) === side)
+    if (!mine.length) return null
+    // główny = ten z największą liczbą potomków (zwykle ma na sobie siatkę), reszta w tym samym miejscu = bliźniaki
+    const main = mine[0]
+    const twins = mine.slice(1).filter((x) => Object.keys(x).every((k) => dist(x[k], main[k]) < 0.02))
+    return { main, twins }
+  }
+  const lLeg = pick(legs, 1, 'thigh')
+  const rLeg = pick(legs, -1, 'thigh')
+  const lArm = pick(arms, 1, 'upper')
+  const rArm = pick(arms, -1, 'upper')
+  if (!lLeg || !rLeg || !lArm || !rArm) return null
+
+  // ── kręgosłup i głowa ──
+  const ancU = [lArm.main.upper, ...ancestors(lArm.main.upper)]
+  const chest = ancestors(rArm.main.upper).find((a) => ancU.includes(a))
+  if (!chest) return null
+  const hips = ancestors(lLeg.main.thigh)
+  const spinePath = [chest, ...ancestors(chest)]
+  const stop = spinePath.findIndex((a) => hips.includes(a))
+  const spines = (stop > 0 ? spinePath.slice(0, stop) : [chest]).reverse() // od dołu
+  const armRoots = new Set([lArm.main.upper, rArm.main.upper, ...ancestors(lArm.main.upper), ...ancestors(rArm.main.upper)])
+  const headChain: THREE.Object3D[] = []
+  let cur = chest
+  for (let i = 0; i < 4; i++) {
+    const next = cur.children
+      .filter((c) => isBone.has(c) && !armRoots.has(c))
+      .filter((c) => hor(c) < 0.06 && yN(c) > yN(cur) - 0.005)
+      .sort((a, b) => yN(b) - yN(a))[0]
+    if (!next) break
+    headChain.push(next)
+    cur = next
+  }
+
+  const found: Partial<Record<BoneKey, THREE.Object3D>> = {
+    spine: spines[0],
+    spine1: spines[1],
+    spine2: spines[2],
+    neck: headChain.length > 1 ? headChain[0] : undefined,
+    head: headChain.length > 1 ? headChain[1] : headChain[0],
+    lUpper: lArm.main.upper,
+    lFore: lArm.main.fore,
+    lHand: lArm.main.hand,
+    rUpper: rArm.main.upper,
+    rFore: rArm.main.fore,
+    rHand: rArm.main.hand,
+    lThigh: lLeg.main.thigh,
+    lCalf: lLeg.main.calf,
+    lFoot: lLeg.main.foot,
+    rThigh: rLeg.main.thigh,
+    rCalf: rLeg.main.calf,
+    rFoot: rLeg.main.foot,
+  }
+  const twins = new Map<THREE.Object3D, THREE.Object3D[]>()
+  const addTwins = (main: Record<string, THREE.Object3D>, list: Record<string, THREE.Object3D>[]) => {
+    for (const k of Object.keys(main)) {
+      const t = list.map((x) => x[k]).filter((b) => b !== main[k])
+      if (t.length) twins.set(main[k], t)
+    }
+  }
+  addTwins(lLeg.main, lLeg.twins)
+  addTwins(rLeg.main, rLeg.twins)
+  addTwins(lArm.main, lArm.twins)
+  addTwins(rArm.main, rArm.twins)
+  return { found, twins, flip: F < 0 }
+}
+
+export function createBoneAnimator(model: THREE.Object3D, reference: THREE.Object3D): BoneAnimator | null {
+  const { found, twins, flip } = resolveBones(model)
+  if (REQUIRED.some((k) => !found[k])) return null
+  const inferred = flip !== undefined
 
   reference.updateMatrixWorld(true)
   const refInv = reference.getWorldQuaternion(new THREE.Quaternion()).invert()
@@ -278,6 +518,12 @@ export function createBoneAnimator(model: THREE.Object3D, reference: THREE.Objec
   const mk = (key: BoneKey, child?: BoneKey): RigBone | null => {
     const bone = found[key]
     if (!bone) return null
+    const rb = mkBone(bone, child)
+    const t = twins.get(bone)
+    if (t) rb.extra = t.map((x) => ({ ...mkBone(x, child), dir: rb.dir }))
+    return rb
+  }
+  const mkBone = (bone: THREE.Object3D, child?: BoneKey): RigBone => {
     const restWorld = refInv.clone().multiply(bone.getWorldQuaternion(new THREE.Quaternion()))
     const dir = new THREE.Vector3(0, 1, 0)
     if (child && found[child]) {
@@ -348,6 +594,7 @@ export function createBoneAnimator(model: THREE.Object3D, reference: THREE.Objec
     leftHand: found.lHand!,
     head: found.head ?? null,
     rightForearm: found.rFore!,
+    inferred,
     update(dt, s) {
       time += dt
       const sp = s.speed
@@ -382,55 +629,33 @@ export function createBoneAnimator(model: THREE.Object3D, reference: THREE.Objec
       }
 
       // ataki — prawa ręka trzyma broń
-      const ease = (x: number) => {
-        const t = Math.min(1, Math.max(0, x))
-        return t * t * (3 - 2 * t)
-      }
-      if (s.action === 'light') {
-        rate = 40
-        const wind = ease(k / 0.28)
-        const hit = ease((k - 0.28) / 0.32)
-        const back = ease((k - 0.7) / 0.3)
-        if (s.combo === 2) {
-          // cios znad głowy oburącz
-          const raise = 2.9 * wind - 2.4 * hit
-          T.rPitch = T.lPitch = raise * (1 - back)
-          T.rElbow = T.lElbow = (0.5 - 0.3 * hit) * (1 - back) + 0.25 * back
-          T.lYaw = -0.35 * (1 - back)
-          T.rYaw = 0.35 * (1 - back)
-          T.lean = (-0.25 * wind + 0.65 * hit) * (1 - back)
-          T.lKnee = T.rKnee = 0.5 * hit * (1 - back)
-          T.lThigh = 0.35 * hit * (1 - back)
-          T.rThigh = -0.25 * hit * (1 - back)
-        } else {
-          // cięcie poziome: combo 0 z prawej na lewo, combo 1 odwrotnie
-          const dir = s.combo === 0 ? 1 : -1
-          const from = -1.3 * dir
-          const to = 1.0 * dir
-          const yaw = from * wind + (to - from) * hit
-          T.rPitch = (1.45 * wind) * (1 - back)
-          T.rYaw = yaw * (1 - back)
-          T.rElbow = (0.15 + 0.4 * (1 - hit)) * (1 - back)
-          T.twist = (from * 0.45 * wind + (to - from) * 0.45 * hit) * (1 - back)
-          T.lPitch = 0.5 * (1 - back)
-          T.lElbow = 1.2
-          T.lean = 0.18 * (1 - back)
-          T.lThigh = 0.4 * (1 - back)
-          T.rThigh = -0.3 * (1 - back)
-          T.lKnee = 0.35 * (1 - back)
-          T.rKnee = 0.25 * (1 - back)
-        }
-      } else if (s.action === 'heavy') {
+      if (s.action === 'light' && s.ranged) {
+        // celowanie: ręka z bronią wyprostowana na wysokości barku, odrzut przy strzale
         rate = 30
-        // obrót z rozłożonymi rękami, na końcu przysiad
-        const open = ease(k / 0.2)
-        const land = ease((k - 0.75) / 0.25)
-        T.lOut = T.rOut = 0.9 * open * (1 - land * 0.6)
-        T.lPitch = T.rPitch = 0.3 * open
-        T.lElbow = T.rElbow = 0.1
-        T.lKnee = T.rKnee = 0.25 + 0.6 * land
-        T.lThigh = T.rThigh = 0.4 * land
-        T.lean = 0.35 * land
+        const recoil = Math.max(0, 1 - k / 0.35) * (k > 0.2 ? 1 : 0)
+        const aim = (p: 'l' | 'r', fire: boolean) => {
+          T[p + 'Pitch'] = 1.5 + (fire ? 0.35 * recoil : 0)
+          T[p + 'Elbow'] = 0.05 + (fire ? 0.25 * recoil : 0)
+          T[p + 'Yaw'] = p === 'r' ? 0.12 : -0.12
+        }
+        if (s.ranged.dual) {
+          aim('r', s.ranged.side < 0)
+          aim('l', s.ranged.side > 0)
+        } else {
+          aim('r', true)
+          // druga ręka podtrzymuje broń
+          T.lPitch = 1.2
+          T.lElbow = 0.9
+          T.lYaw = -0.5
+        }
+        T.lean = 0.06 - 0.06 * recoil
+        T.lThigh = 0.15
+        T.rThigh = -0.15
+        T.lKnee = T.rKnee = 0.15
+      } else if ((s.action === 'light' || s.action === 'heavy') && s.style) {
+        rate = attackPose(T, { action: s.action, style: s.style, flavor: s.flavor ?? DEFAULT_FLAVOR, combo: s.combo, k })
+      } else if (s.action === 'light' || s.action === 'heavy') {
+        rate = attackPose(T, { action: s.action, style: 'blade', flavor: DEFAULT_FLAVOR, combo: s.combo, k })
       } else if (s.action === 'dodge') {
         rate = 40
         T.lThigh = 0.9
@@ -485,4 +710,29 @@ export function createBoneAnimator(model: THREE.Object3D, reference: THREE.Objec
       }
     },
   }
+}
+
+/** Chowa siatki broni, które po przypięciu nie są przy dłoni (leżą na ziemi / unoszą się obok postaci). */
+export function hideUnheldWeapons(model: THREE.Object3D, hands: THREE.Object3D[], maxDist: number) {
+  model.updateMatrixWorld(true)
+  const hp = hands.map((h) => h.getWorldPosition(new THREE.Vector3()))
+  const box = new THREE.Box3()
+  const c = new THREE.Vector3()
+  let hidden = 0
+  model.traverse((o) => {
+    const m = o as THREE.SkinnedMesh
+    if (!m.isMesh || !m.visible || !isWeaponMesh(m)) return
+    if (m.isSkinnedMesh) m.computeBoundingBox()
+    else if (!m.geometry.boundingBox) m.geometry.computeBoundingBox()
+    const bb = m.isSkinnedMesh ? m.boundingBox : m.geometry.boundingBox
+    if (!bb || bb.isEmpty()) return
+    box.copy(bb).applyMatrix4(m.matrixWorld)
+    // najbliższy punkt broni do dłoni (długa broń może mieć środek daleko od chwytu)
+    const d = Math.min(...hp.map((p) => box.clampPoint(p, c).distanceTo(p)))
+    if (d > maxDist) {
+      m.visible = false
+      hidden++
+    }
+  })
+  return hidden
 }
