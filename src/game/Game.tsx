@@ -59,10 +59,14 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
               <b>K</b>
               <small title={hud?.superName}>{hud && hud.special > 0 ? hud.special.toFixed(1) : 'SUPER'}</small>
             </div>
-            <div className={`hud-cd ${hud && hud.dodge <= 0 ? 'ready' : ''}`}>
-              <i style={{ height: `${hud ? (1 - hud.dodge / 0.8) * 100 : 100}%` }} />
-              <b>␣</b>
-              <small>UNIK</small>
+            <div className={`hud-cd ${hud && hud.dodge > 0 ? 'ready' : ''} ${hud?.counter ? 'counter' : ''}`}>
+              <i style={{ height: `${hud ? hud.dodgeT * 100 : 100}%` }} />
+              <b className="pips">
+                {Array.from({ length: hud?.dodgeMax ?? 2 }, (_, k) => (
+                  <em key={k} className={hud && k < hud.dodge ? 'on' : ''} />
+                ))}
+              </b>
+              <small>{hud?.counter ? 'KONTRA' : 'UNIK ⇧'}</small>
             </div>
           </div>
         </div>
@@ -93,7 +97,7 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
             <span><b>J</b>/<b>LPM</b> atak (combo ×3)</span>
             <span><b>K</b>/<b>PPM</b> specjalny</span>
             <span><b>Spacja</b> skok</span>
-            <span><b>Shift</b> unik</span>
+            <span><b>Shift</b> unik ×2 (też w locie, tuż przed ciosem = kontra)</span>
             <span><b>Esc</b> wyjście</span>
           </div>
         )}
@@ -126,6 +130,10 @@ export function Game({ agent, onExit, onChangeAgent, onReward }: { agent: Item; 
             <b>{hud.stats.taken.toLocaleString()}</b>
             <span>Najdłuższe combo</span>
             <b>{hud.stats.maxCombo}×</b>
+            <span>Perfekcyjne uniki</span>
+            <b>{hud.stats.perfect}</b>
+            <span>Monety z platform</span>
+            <b>{hud.stats.coins}</b>
             <span>Apteczki</span>
             <b>{hud.stats.heals}</b>
             <span>Zarobione</span>

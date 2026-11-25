@@ -18,14 +18,12 @@ export const BIOME_NAME: Record<Biome, string> = {
   volcano: 'Wulkaniczne pustkowie',
   neon: 'Neonowa noc',
 }
-const ORDER: Biome[] = ['city', 'forest', 'arctic', 'volcano', 'neon']
+export const BIOMES: Biome[] = ['city', 'forest', 'arctic', 'volcano', 'neon']
 
-/** Biom dla poziomu: najpierw po kolei wszystkie, potem losowo (bez powtórki z rzędu). */
-export function biomeFor(level: number, seed: number): Biome {
-  if (level <= ORDER.length) return ORDER[level - 1]
-  const prev = biomeFor(level - 1, seed - 1)
-  const pool = ORDER.filter((b) => b !== prev)
-  return pool[Math.abs(seed) % pool.length]
+/** Losowy biom — inny niż poprzedni (pierwszy poziom też losowy). */
+export function randomBiome(prev?: Biome | null): Biome {
+  const pool = BIOMES.filter((b) => b !== prev)
+  return pool[Math.floor(Math.random() * pool.length)]
 }
 
 export interface Env {
@@ -70,6 +68,23 @@ export interface Pad {
   target: THREE.Vector3
 }
 
+/** Swobodna platforma (kamień w powietrzu, stopień schodów). */
+export interface Plat {
+  x: number
+  z: number
+  hw: number
+  hd: number
+  y: number
+  /** stopień schodów (blokuje z boku); inaczej jednostronna — wskakuje się od dołu */
+  solid: boolean
+  move?: { ax: number; az: number; amp: number; speed: number; ph: number }
+  ox: number
+  oz: number
+  dx: number
+  dz: number
+  mesh?: THREE.Object3D
+}
+
 /** Kontekst przekazywany dekoratorom biomu i zagrożeniom. */
 export interface DecorCtx {
   scene: THREE.Scene
@@ -104,8 +119,12 @@ export interface City {
   start: THREE.Vector3
   bossCenter: THREE.Vector3
   heals: THREE.Vector3[]
+  /** monety ◈ na platformach */
+  coins: THREE.Vector3[]
   pads: Pad[]
   hazards: Hazards
+  /** przesunięcie ruchomej platformy pod ciałem w tej klatce (do „wiezienia” ciała) */
+  carry(p: THREE.Vector3): { x: number; z: number } | null
   spawnPoint(from: THREE.Vector3, min: number, max: number): THREE.Vector3
   randomPoint(avoid: THREE.Vector3, minDist: number): THREE.Vector3
   inBossRoom(p: THREE.Vector3): boolean
@@ -131,8 +150,7 @@ const DIRS: [number, number][] = [
   [0, -1],
 ]
 
-export function buildWorld(scene: THREE.Scene, accent: THREE.Color, level: number, seed: number): City {
-  const biome = biomeFor(level, seed)
+export function buildWorld(scene: THREE.Scene, accent: THREE.Color, level: number, seed: number, biome: Biome): City {
   setGrid(generateMap(level, seed, MAP_OPTS[biome]))
   const rng = rngFrom(seed ^ 0x5bd1e995)
   const disposables: { dispose(): void }[] = []
@@ -272,8 +290,8 @@ export function buildWorld(scene: THREE.Scene, accent: THREE.Color, level: numbe
   // ── platformy w powietrzu + wyrzutnie (las, miasta) ──────
   const decks: Deck[] = []
   const pads: Pad[] = []
-  if (biome === 'forest' || biome === 'city' || biome === 'neon') {
-    const want = biome === 'forest' ? 4 : 2
+  {
+    const want = biome === 'forest' ? 4 : 3
     const cand = blobs.filter((b, k) => !raisedBlobs.has(k) && b.length >= 4).sort(() => rng() - 0.5)
     for (const b of cand) {
       if (decks.length >= want) break
@@ -288,7 +306,7 @@ export function buildWorld(scene: THREE.Scene, accent: THREE.Color, level: numbe
       if (!cells) continue
       const isDeck = (i: number, j: number) => cells!.some(([a, c]) => a === i && c === j)
       // wyrzutnia: komórka plamy obok platformy (nie pod nią)
-      const padCell = b.find(([i, j]) => !isDeck(i, j) && MAP[j][i] !== 'H' && kind[id(i, j)] !== Ground.Lava && cells!.some(([a, c]) => Math.abs(a - i) + Math.abs(c - j) === 1))
+      const padCell = b.find(([i, j]) => !isDeck(i, j) && MAP[j][i] !== 'H' && (kind[id(i, j)] === Ground.Normal || kind[id(i, j)] === Ground.Water) && cells!.some(([a, c]) => Math.abs(a - i) + Math.abs(c - j) === 1))
       if (!padCell) continue
       const y = DECK_Y + (biome === 'forest' ? Math.floor(rng() * 2) * LEVEL_H : 0)
       const center = new THREE.Vector3()
@@ -308,6 +326,85 @@ export function buildWorld(scene: THREE.Scene, accent: THREE.Color, level: numbe
 
   for (const h of heals) h.y = heights[id(ci(h.x), cj(h.z))]
 
+  // ── schody, kamienie-parkour, ruchome platformy, monety ──
+  const plats: Plat[] = []
+  const coins: THREE.Vector3[] = []
+  const isPadCell = (i: number, j: number) => pads.some((p) => p.i === i && p.j === j)
+  const isDeckCell = (i: number, j: number) => inMap(i, j) && deckY[id(i, j)] > 0
+  const freeAt = (x: number, z: number, r: number) => !wall(ci(x - r), cj(z - r)) && !wall(ci(x + r), cj(z - r)) && !wall(ci(x - r), cj(z + r)) && !wall(ci(x + r), cj(z + r))
+  const plat = (x: number, z: number, hw: number, hd: number, y: number, solid: boolean, move?: Plat['move']) => {
+    const p: Plat = { x, z, hw, hd, y, solid, move, ox: 0, oz: 0, dx: 0, dz: 0 }
+    plats.push(p)
+    return p
+  }
+  // schody: po jednych na każdym podwyższeniu (i drugim piętrze) — wejście bez skakania
+  const stairDone = new Set<string>()
+  for (const [i, j] of walk.slice().sort(() => rng() - 0.5)) {
+    const h = heights[id(i, j)]
+    if (h <= 0) continue
+    const key = `${blobId[id(i, j)]}:${h}`
+    if (stairDone.has(key)) continue
+    for (const [di, dj] of DIRS) {
+      const li = i + di
+      const lj = j + dj
+      if (!inMap(li, lj) || wall(li, lj)) continue
+      const lh = heights[id(li, lj)]
+      if (h - lh < LEVEL_H * 0.9 || kind[id(li, lj)] !== Ground.Normal || isPadCell(li, lj) || isDeckCell(li, lj) || '.PH'.indexOf(MAP[lj][li]) < 0) continue
+      // krawędź między komórkami; stopnie po stronie niższej
+      const ex = cx(i) + di * (CELL / 2)
+      const ez = cz(j) + dj * (CELL / 2)
+      const along = di === 0
+      for (let k = 1; k <= 2; k++) {
+        const off = k === 2 ? 0.6 : 1.8
+        const x = ex + di * off
+        const z = ez + dj * off
+        plat(x, z, along ? 1.4 : 0.6, along ? 0.6 : 1.4, lh + (LEVEL_H / 3) * k, true)
+      }
+      stairDone.add(key)
+      break
+    }
+  }
+  // kamienie prowadzące na platformy (do skakania), środkowy jeździ
+  const stonesFor: Plat[][] = []
+  for (const d of decks) {
+    let chain: Plat[] | null = null
+    for (const [ci0, cj0] of d.cells) {
+      if (chain) break
+      for (const [di, dj] of DIRS.slice().sort(() => rng() - 0.5)) {
+        const n1 = [ci0 + di, cj0 + dj]
+        const n2 = [ci0 + 2 * di, cj0 + 2 * dj]
+        if ([n1, n2].some(([a, b]) => !inMap(a, b) || wall(a, b) || isDeckCell(a, b) || heights[id(a, b)] > 0)) continue
+        const ex = cx(ci0) + di * (CELL / 2)
+        const ez = cz(cj0) + dj * (CELL / 2)
+        const hs = d.y > DECK_Y + 0.5 ? [1.3, 2.5, 3.6, 4.6] : [1.3, 2.4, 3.4]
+        const n = hs.length
+        const tmp: Plat[] = []
+        let ok = true
+        for (let k = 0; k < n; k++) {
+          const dist = 1.6 + (n - 1 - k) * 2.5
+          const lat = (k % 2 ? 1 : -1) * 1.1
+          const x = ex + di * dist + (di === 0 ? lat : 0)
+          const z = ez + dj * dist + (dj === 0 ? lat : 0)
+          if (!freeAt(x, z, 1.1)) {
+            ok = false
+            break
+          }
+          const mv = k === 1 ? { ax: di === 0 ? 1 : 0, az: dj === 0 ? 1 : 0, amp: 1.3, speed: 1.1, ph: rng() * 6 } : undefined
+          tmp.push({ x, z, hw: 0.95, hd: 0.95, y: hs[k], solid: false, move: mv, ox: 0, oz: 0, dx: 0, dz: 0 })
+        }
+        if (!ok) continue
+        chain = tmp
+        plats.push(...tmp)
+      }
+    }
+    if (chain) {
+      stonesFor.push(chain)
+      for (const st of chain.slice(1)) if (!st.move) coins.push(new THREE.Vector3(st.x, st.y + 0.9, st.z))
+    }
+    // nagroda na górze
+    for (let k = 0; k < 3; k++) coins.push(new THREE.Vector3(d.center.x + (k - 1) * 1.4, d.y + 0.9, d.center.z))
+  }
+
   // ── kolizje: ściany + podwyższenia ───────────────────────
   const boxes: Box[] = []
   for (let j = 0; j < GH; j++)
@@ -316,6 +413,7 @@ export function buildWorld(scene: THREE.Scene, accent: THREE.Color, level: numbe
       if (wall(i, j)) boxes.push(b)
       else if (heights[id(i, j)] > 0) boxes.push({ ...b, top: heights[id(i, j)] })
     }
+  for (const p of plats) if (p.solid) boxes.push({ minX: p.x - p.hw, maxX: p.x + p.hw, minZ: p.z - p.hd, maxZ: p.z + p.hd, top: p.y })
 
   const floorY = (i: number, j: number) => (inMap(i, j) ? heights[id(i, j)] : 0)
   const ground = (i: number, j: number) => (inMap(i, j) ? (kind[id(i, j)] as Ground) : Ground.Normal)
@@ -417,42 +515,131 @@ export function buildWorld(scene: THREE.Scene, accent: THREE.Color, level: numbe
     return out
   }
 
-  // ── wysepki / podwyższenia: geometria (kolory biomu) ─────
-  const PLAT: Record<Biome, [number, number]> = {
-    city: [0x8a857c, 0x6a665f],
-    neon: [0x3a3550, 0x24203a],
-    forest: [0x5f9a3c, 0x6b5d4a],
-    arctic: [0xf4f8fc, 0x9cc4e4],
-    volcano: [0x3b302c, 0x241a17],
+  // ── podwyższenia: bryła + nawis z krawędzią + skały u podnóża ─
+  const PLAT: Record<Biome, { top: number; side: number; rim: number; rimGlow: boolean }> = {
+    city: { top: 0x9a948a, side: 0x6a665f, rim: 0xffc23f, rimGlow: false },
+    neon: { top: 0x3f3a58, side: 0x24203a, rim: 0xff3ea5, rimGlow: true },
+    forest: { top: 0x5f9a3c, side: 0x6b5d4a, rim: 0x9cff6a, rimGlow: true },
+    arctic: { top: 0xf4f8fc, side: 0x8fb4d4, rim: 0xffffff, rimGlow: false },
+    volcano: { top: 0x3b302c, side: 0x241a17, rim: 0xff6a1a, rimGlow: true },
+  }
+  const PS = PLAT[biome]
+  const topC = new THREE.Color(PS.top)
+  const sideC = new THREE.Color(PS.side)
+  const colorize = (g: THREE.BufferGeometry, top: THREE.Color, side: THREE.Color, tone: number) => {
+    const nrm = g.getAttribute('normal') as THREE.BufferAttribute
+    const cols = new Float32Array(nrm.count * 3)
+    const c = new THREE.Color()
+    for (let k = 0; k < nrm.count; k++) {
+      c.copy(nrm.getY(k) > 0.5 ? top : side).multiplyScalar(tone)
+      cols.set([c.r, c.g, c.b], k * 3)
+    }
+    g.setAttribute('color', new THREE.BufferAttribute(cols, 3))
+    if (g.getAttribute('uv')) g.deleteAttribute('uv')
+    return g.index ? g.toNonIndexed() : g
   }
   {
-    const [topC, sideC] = PLAT[biome].map((c) => new THREE.Color(c))
     const geos: THREE.BufferGeometry[] = []
-    const col = new THREE.Color()
+    const rims: THREE.BufferGeometry[] = []
+    const natural = biome === 'forest' || biome === 'arctic' || biome === 'volcano'
     for (const [i, j] of walk) {
       const h = heights[id(i, j)]
       if (h <= 0) continue
-      const g = new THREE.BoxGeometry(CELL, h, CELL)
-      g.translate(cx(i), h / 2, cz(j))
-      const nrm = g.getAttribute('normal') as THREE.BufferAttribute
-      const pos = g.getAttribute('position') as THREE.BufferAttribute
-      const cols = new Float32Array(nrm.count * 3)
-      const tone = 0.9 + rng() * 0.2
-      for (let k = 0; k < nrm.count; k++) {
-        const top = nrm.getY(k) > 0.5
-        col.copy(top ? topC : sideC).multiplyScalar(tone * (top ? 1 : 0.75 + (pos.getY(k) / h) * 0.3))
-        cols.set([col.r, col.g, col.b], k * 3)
+      const tone = 0.88 + rng() * 0.2
+      const body = new THREE.BoxGeometry(CELL, h - 0.3, CELL)
+      body.translate(cx(i), (h - 0.3) / 2, cz(j))
+      geos.push(colorize(body, sideC, sideC, tone * 0.85))
+      // nawis (lekko wystający wierzch)
+      const cap = new THREE.BoxGeometry(CELL + 0.25, 0.3, CELL + 0.25)
+      cap.translate(cx(i), h - 0.15, cz(j))
+      geos.push(colorize(cap, topC, topC.clone().multiplyScalar(0.8), tone))
+      for (const [di, dj] of DIRS) {
+        const ni = i + di
+        const nj = j + dj
+        if (wall(ni, nj) || heights[id(ni, nj)] >= h) continue
+        const along = di === 0
+        // świecąca/kolorowa krawędź — widać, gdzie kończy się półka
+        const rim = new THREE.BoxGeometry(along ? CELL + 0.25 : 0.14, 0.08, along ? 0.14 : CELL + 0.25)
+        rim.translate(cx(i) + di * (CELL / 2 + 0.1), h + 0.01, cz(j) + dj * (CELL / 2 + 0.1))
+        rims.push(rim)
+        // skały / gruz u podnóża ściany
+        for (let k = 0; k < (natural ? 3 : 2); k++) {
+          const r = 0.35 + rng() * 0.55
+          const b = natural ? new THREE.IcosahedronGeometry(r, 0) : new THREE.BoxGeometry(r * 1.6, r, r * 1.2)
+          const off = (rng() - 0.5) * (CELL - 1.5)
+          b.rotateY(rng() * 3)
+          b.translate(cx(i) + di * (CELL / 2 + r * 0.5) + (along ? off : 0), heights[id(ni, nj)] + r * 0.4, cz(j) + dj * (CELL / 2 + r * 0.5) + (along ? 0 : off))
+          geos.push(colorize(b, topC, sideC, 0.7 + rng() * 0.3))
+        }
+        // pionowe pęknięcia / belki na ścianie półki (miasto)
+        if (!natural && rng() < 0.6) {
+          const beam = new THREE.BoxGeometry(along ? 0.25 : 0.12, h - 0.3, along ? 0.12 : 0.25)
+          const off = (rng() - 0.5) * (CELL - 1)
+          beam.translate(cx(i) + di * (CELL / 2 + 0.04) + (along ? off : 0), (h - 0.3) / 2, cz(j) + dj * (CELL / 2 + 0.04) + (along ? 0 : off))
+          geos.push(colorize(beam, new THREE.Color(0x5a3b28), new THREE.Color(0x5a3b28), 1))
+        }
       }
-      g.setAttribute('color', new THREE.BufferAttribute(cols, 3))
-      geos.push(g)
+    }
+    // stopnie schodów
+    for (const p of plats) {
+      if (!p.solid) continue
+      const base = Math.max(0, p.y - LEVEL_H / 3 - 0.02)
+      const g = new THREE.BoxGeometry(p.hw * 2, p.y - base + 0.02, p.hd * 2)
+      g.translate(p.x, (p.y + base) / 2, p.z)
+      geos.push(colorize(g, topC, sideC, 0.95))
+      // pod stopniem do ziemi (żeby nie wisiał)
+      if (base > 0.05) {
+        const f = new THREE.BoxGeometry(p.hw * 2, base, p.hd * 2)
+        f.translate(p.x, base / 2, p.z)
+        geos.push(colorize(f, sideC, sideC, 0.8))
+      }
     }
     if (geos.length) {
       const merged = T(mergeGeometries(geos)!)
       geos.forEach((g) => g.dispose())
-      const mesh = new THREE.Mesh(merged, T(new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95, flatShading: true })))
+      const mesh = new THREE.Mesh(merged, T(new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, flatShading: true })))
       mesh.castShadow = true
       mesh.receiveShadow = true
       group.add(mesh)
+    }
+    if (rims.length) {
+      const merged = T(mergeGeometries(rims)!)
+      rims.forEach((g) => g.dispose())
+      const mat = PS.rimGlow ? T(new THREE.MeshBasicMaterial({ color: PS.rim })) : T(new THREE.MeshStandardMaterial({ color: PS.rim, roughness: 0.6 }))
+      group.add(new THREE.Mesh(merged, mat))
+    }
+  }
+
+  // ── kamienie w powietrzu (parkour) — osobne meshe, bo część jeździ ─
+  {
+    const natural = biome !== 'city' && biome !== 'neon'
+    const slab = new THREE.CylinderGeometry(1.15, 1.0, 0.45, natural ? 7 : 4, 1)
+    if (!natural) slab.rotateY(Math.PI / 4)
+    slab.translate(0, -0.225, 0)
+    const under = natural ? new THREE.ConeGeometry(0.95, 1.6, 7) : new THREE.BoxGeometry(1.2, 0.5, 1.2)
+    if (natural) under.rotateX(Math.PI)
+    under.translate(0, natural ? -1.2 : -0.7, 0)
+    const g = T(mergeGeometries([colorize(slab, topC, sideC, 1), colorize(under, sideC, sideC, 0.8)])!)
+    slab.dispose()
+    under.dispose()
+    const mat = T(new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, flatShading: true }))
+    const rimGeo = T(new THREE.TorusGeometry(1.08, 0.05, 6, natural ? 7 : 4))
+    rimGeo.rotateX(Math.PI / 2)
+    if (!natural) rimGeo.rotateY(Math.PI / 4)
+    const rimMat = T(new THREE.MeshBasicMaterial({ color: PS.rim }))
+    const moveMat = T(new THREE.MeshBasicMaterial({ color: accent.clone() }))
+    for (const p of plats) {
+      if (p.solid) continue
+      const m = new THREE.Mesh(g, mat)
+      m.castShadow = true
+      m.receiveShadow = true
+      const rim = new THREE.Mesh(rimGeo, p.move ? moveMat : rimMat)
+      rim.position.y = 0.01
+      m.add(rim)
+      m.position.set(p.x, p.y, p.z)
+      m.rotation.y = rng() * Math.PI
+      group.add(m)
+      p.mesh = m
     }
   }
 
@@ -479,6 +666,7 @@ export function buildWorld(scene: THREE.Scene, accent: THREE.Color, level: numbe
     start,
     bossCenter,
     heals,
+    coins,
     pads,
     hazards,
     wallAt,
@@ -488,9 +676,19 @@ export function buildWorld(scene: THREE.Scene, accent: THREE.Color, level: numbe
       const j = cj(z)
       if (!inMap(i, j)) return 0
       const c = id(i, j)
-      if (deckY[c] > 0 && y >= deckY[c] - 0.35) return deckY[c]
-      if (holes[c]) return -60
-      return heights[c]
+      let g = deckY[c] > 0 && y >= deckY[c] - 0.35 ? deckY[c] : holes[c] ? -60 : heights[c]
+      for (const p of plats) {
+        if (p.y <= g || y < p.y - (p.solid ? 0.55 : 0.35)) continue
+        if (Math.abs(x - p.x - p.ox) <= p.hw + 0.1 && Math.abs(z - p.z - p.oz) <= p.hd + 0.1) g = p.y
+      }
+      return g
+    },
+    carry(pt) {
+      for (const p of plats) {
+        if (!p.move || Math.abs(pt.y - p.y) > 0.06) continue
+        if (Math.abs(pt.x - p.x - p.ox) <= p.hw + 0.1 && Math.abs(pt.z - p.z - p.oz) <= p.hd + 0.1) return { x: p.dx, z: p.dz }
+      }
+      return null
     },
     groundKind(x, z) {
       const i = ci(x)
@@ -553,6 +751,17 @@ export function buildWorld(scene: THREE.Scene, accent: THREE.Color, level: numbe
     },
     update(time, dt, player, camera) {
       uTime.value = time
+      for (const p of plats) {
+        if (!p.move) continue
+        const k = Math.sin(time * p.move.speed + p.move.ph) * p.move.amp
+        const nx = p.move.ax * k
+        const nz = p.move.az * k
+        p.dx = nx - p.ox
+        p.dz = nz - p.oz
+        p.ox = nx
+        p.oz = nz
+        p.mesh?.position.set(p.x + nx, p.y, p.z + nz)
+      }
       target.copy(player)
       rebuildField(ci(player.x), cj(player.z))
       decor.update(time, dt, player, camera)

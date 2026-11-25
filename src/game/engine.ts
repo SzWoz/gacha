@@ -1,6 +1,6 @@
 import * as THREE from 'three'
 import { pushOutOfBoxes } from './grid'
-import { buildWorld, Ground, type City, type Env } from './world'
+import { buildWorld, Ground, randomBiome, type City, type Env } from './world'
 import type { Body, HazardApi } from './hazards'
 
 import { ELEMENT_COLORS, type Item } from '../data/roster'
@@ -25,7 +25,15 @@ const COMBO_WINDOW = 0.45
 const DODGE_DUR = 0.22
 const DODGE_SPEED = 19
 const DODGE_IFRAMES = 0.35
-const DODGE_CD = 0.8
+const DODGE_CD = 0.22
+const DODGE_CHARGES = 2
+const DODGE_RECHARGE = 1.1
+/** okno perfekcyjnego uniku od startu uniku */
+const PERFECT_WIN = 0.3
+const SLOWMO_DUR = 1.4
+const SLOWMO_SCALE = 0.28
+const COUNTER_WIN = 2.2
+const COUNTER_MUL = 2.2
 const GRAVITY = 28
 const JUMP_V = 10.5
 const COYOTE = 0.12
@@ -45,6 +53,11 @@ export interface HudState {
   special: number // seconds left on cooldown
   specialMax: number
   dodge: number
+  /** naładowanie następnego uniku 0..1 */
+  dodgeT: number
+  dodgeMax: number
+  counter: boolean
+  coins: number
   wave: number
   kills: number
   score: number
@@ -76,6 +89,8 @@ export interface LevelStats {
   dealt: number
   taken: number
   heals: number
+  coins: number
+  perfect: number
   earned: number
   maxCombo: number
 }
@@ -214,6 +229,17 @@ export class GameEngine {
   private shotSide = 1
   private specialCd = 0
   private dodgeCd = 0
+  private dodgeCharges = DODGE_CHARGES
+  private dodgeRecharge = 0
+  private dodgeStartT = -9
+  private airDashUsed = false
+  private slowmo = 0
+  private counterT = 0
+  private counterAction = false
+  private perfectFrom = new Set<object>()
+  private coinMeshes: THREE.Mesh[] = []
+  private coinGeo: THREE.BufferGeometry | null = null
+  private coinMat: THREE.Material | null = null
   private iframes = 0
   private dodgeDir = new THREE.Vector3()
   private speedFactor = 0
@@ -352,11 +378,12 @@ export class GameEngine {
     this.player.add(rim)
 
     // miasto: ulice, budynki, plac, latarnie, auta
-    this.city = buildWorld(s, this.colorA, this.level, (Math.random() * 1e9) | 0)
+    this.city = buildWorld(s, this.colorA, this.level, (Math.random() * 1e9) | 0, randomBiome())
     this.applyEnv(this.city.env)
     this.ppos.copy(this.city.start)
     this.lastSafe.copy(this.ppos)
     this.placeHeals()
+    this.placeCoins()
     this.setHint()
 
     // minimapa
@@ -491,7 +518,7 @@ export class GameEngine {
     } else if (a === 'special') {
       if (this.specialCd <= 0 && (this.action === 'none' || this.action === 'light')) this.startHeavy()
     } else if (a === 'dodge') {
-      if (this.dodgeCd <= 0 && this.action !== 'heavy') this.startDodge()
+      if (this.dodgeCd <= 0 && this.dodgeCharges > 0 && this.action !== 'heavy' && (this.body.grounded || !this.airDashUsed)) this.startDodge()
     } else if (a === 'jump') this.jumpBuf = 0.14
   }
 
@@ -551,6 +578,33 @@ export class GameEngine {
     this.actionDur = this.ranged ? LIGHT_DUR[this.combo] : this.spec.dur[this.combo] / this.flavor.tempo
     this.swingHit = false
     this.queuedAttack = false
+    this.useCounter()
+  }
+
+  /** kontra po perfekcyjnym uniku: następny atak ×2.2 */
+  private useCounter() {
+    if (this.counterT <= 0) return
+    this.counterT = 0
+    this.counterAction = true
+    this.floatText(this.ppos.clone().setY(this.ppos.y + 2.6), 'KONTRA!', 'super')
+  }
+
+  /** wróg trafiłby w trakcie uniku → zwolnienie czasu, kontra, zwrot ładunku */
+  private perfectDodge(e: Enemy) {
+    if (this.perfectFrom.has(e)) return
+    this.perfectFrom.add(e)
+    if (this.perfectFrom.size > 1) return
+    this.slowmo = SLOWMO_DUR
+    this.counterT = COUNTER_WIN
+    this.dodgeCharges = Math.min(DODGE_CHARGES, this.dodgeCharges + 1)
+    this.specialCd = Math.max(0, this.specialCd - 2)
+    this.iframes = Math.max(this.iframes, 0.5)
+    this.stats.perfect++
+    this.container.classList.add('slowmo')
+    this.floatText(this.ppos.clone().setY(this.ppos.y + 2.4), 'PERFEKCYJNY UNIK', 'perfect')
+    for (let i = 0; i < 18; i++) this.spawnParticle(this.ppos.clone().setY(this.ppos.y + 1), new THREE.Color(0x9ff4ff), 5, 0.6)
+    this.spawnBurst(this.ppos.clone(), 2.2, new THREE.Color(0x9ff4ff))
+    this.emitHud(true)
   }
 
   private startHeavy() {
@@ -558,6 +612,7 @@ export class GameEngine {
     this.actionT = 0
     this.actionDur = this.spec.superDur
     this.specialCd = this.spec.superCd
+    this.useCounter()
     this.swingHit = false
     this.queuedAttack = false
     this.iframes = Math.max(this.iframes, this.spec.superDur)
@@ -579,6 +634,14 @@ export class GameEngine {
     this.actionDur = DODGE_DUR
     this.iframes = DODGE_IFRAMES
     this.dodgeCd = DODGE_CD
+    this.dodgeCharges--
+    this.dodgeStartT = this.time
+    this.perfectFrom.clear()
+    if (!this.body.grounded) {
+      // zryw w powietrzu — raz na lot, lekko podbija
+      this.airDashUsed = true
+      this.body.vy = Math.max(this.body.vy, 2.5)
+    }
     this.queuedAttack = false
     this.combo = 0
     for (let i = 0; i < 8; i++) this.spawnParticle(this.ppos.clone().setY(this.ppos.y + 0.4), this.colorB, 3, 0.35)
@@ -1083,6 +1146,11 @@ export class GameEngine {
   }
 
   private damageEnemy(e: Enemy, dmg: number, knock: number, crit: boolean) {
+    if (this.counterAction) {
+      dmg = Math.round(dmg * COUNTER_MUL)
+      crit = true
+      knock *= 1.5
+    }
     this.aggro(e)
     e.hp -= dmg
     this.stats.dealt += dmg
@@ -1192,6 +1260,40 @@ export class GameEngine {
     })
   }
 
+  private placeCoins() {
+    for (const m of this.coinMeshes) this.scene.remove(m)
+    if (!this.coinGeo) {
+      this.coinGeo = new THREE.CylinderGeometry(0.32, 0.32, 0.08, 6).rotateX(Math.PI / 2)
+      this.coinMat = new THREE.MeshStandardMaterial({ color: 0xffd34d, emissive: 0xb07a00, emissiveIntensity: 0.9, metalness: 0.7, roughness: 0.3 })
+      this.disposables.push(this.coinGeo, this.coinMat)
+    }
+    this.coinMeshes = this.city.coins.map((p) => {
+      const m = new THREE.Mesh(this.coinGeo!, this.coinMat!)
+      m.position.copy(p)
+      m.userData.base = p.clone()
+      this.scene.add(m)
+      return m
+    })
+  }
+
+  private updateCoins(dt: number) {
+    for (const m of this.coinMeshes) {
+      if (!m.visible) continue
+      const base = m.userData.base as THREE.Vector3
+      // monety na ruchomych kamieniach podążają za nimi
+      m.position.y = base.y + Math.sin(this.time * 3 + base.x) * 0.12
+      m.rotation.y += dt * 3
+      const dx = this.ppos.x - m.position.x
+      const dz = this.ppos.z - m.position.z
+      if (dx * dx + dz * dz < 1.1 * 1.1 && Math.abs(this.ppos.y + 0.9 - m.position.y) < 1.3) {
+        m.visible = false
+        this.stats.coins++
+        this.reward(8, m.position.clone().setY(m.position.y + 0.8))
+        for (let i = 0; i < 8; i++) this.spawnParticle(m.position.clone(), new THREE.Color(0xffd34d), 3, 0.4)
+      }
+    }
+  }
+
   // ───────────── fizyka: grawitacja, skoki, wyrzutnie ─────────────
 
   /** wyrzut z wyrzutni: pionowo + poziomo tak, by wylądować na platformie */
@@ -1207,6 +1309,14 @@ export class GameEngine {
 
   /** wspólna fizyka pionowa ciała; zwraca prędkość uderzenia przy lądowaniu (0 gdy w powietrzu / stoi) */
   private integrate(b: Body, dt: number) {
+    if (b.grounded) {
+      // ruchoma platforma wiezie ciało
+      const c = this.city.carry(b.pos)
+      if (c) {
+        b.pos.x += c.x
+        b.pos.z += c.z
+      }
+    }
     b.pos.addScaledVector(b.vel, dt)
     b.vel.multiplyScalar(Math.exp((b.grounded ? -8 : -0.4) * dt))
     const g = this.city.groundAt(b.pos.x, b.pos.z, b.pos.y)
@@ -1242,6 +1352,8 @@ export class GameEngine {
       this.jumpBuf = 0
       for (let i = 0; i < 6; i++) this.spawnParticle(this.ppos.clone().setY(this.ppos.y + 0.1), this.colorA, 2, 0.35)
     }
+    if (this.action === 'dodge' && !b.grounded) b.vy = Math.max(b.vy, 0.6) // zryw: chwilowo bez spadania
+    if (b.grounded) this.airDashUsed = false
     this.collide(this.ppos, PLAYER_R)
     const impact = this.integrate(b, dt)
     if (impact > 9) {
@@ -1332,20 +1444,21 @@ export class GameEngine {
     this.level = level
     this.removePortal()
     this.city.dispose()
-    this.city = buildWorld(this.scene, this.colorA, level, (Math.random() * 1e9) | 0)
+    this.city = buildWorld(this.scene, this.colorA, level, (Math.random() * 1e9) | 0, randomBiome(this.city.biome))
     this.applyEnv(this.city.env)
     this.ppos.copy(this.city.start)
     this.lastSafe.copy(this.ppos)
     this.body.vel.set(0, 0, 0)
     this.body.vy = 0
     this.placeHeals()
+    this.placeCoins()
     this.stats = this.freshStats()
     this.levelDone = false
     this.setHint()
   }
 
   private freshStats(): LevelStats {
-    return { level: this.level ?? 1, biome: '', time: 0, kills: 0, envKills: 0, dealt: 0, taken: 0, heals: 0, earned: 0, maxCombo: 0 }
+    return { level: this.level ?? 1, biome: '', time: 0, kills: 0, envKills: 0, dealt: 0, taken: 0, heals: 0, coins: 0, perfect: 0, earned: 0, maxCombo: 0 }
   }
 
   private setHint() {
@@ -1536,7 +1649,7 @@ export class GameEngine {
               const ga = this.city.groundAt(e.pos.x + desired.x * (e.r + 0.7), e.pos.z + desired.z * (e.r + 0.7), e.pos.y)
               const up = ga - e.pos.y
               const hop = dyP > 0.8 && dyP < 2.2 && dist < 3.5
-              if ((up > 0.4 && up < 1.9) || hop) {
+              if ((up > 0.55 && up < 1.9) || hop) {
                 e.vy = e.kind === 'brute' ? 9.6 : 10
                 e.grounded = false
               }
@@ -1561,7 +1674,12 @@ export class GameEngine {
             e.ring.visible = false
             // lunge
             if (dist > 0.01) e.vel.addScaledVector(toP.clone().divideScalar(dist), e.kind === 'brute' ? 5 : 8)
-            if (dist < e.reach + PLAYER_R + 0.3 && Math.abs(this.ppos.y - e.pos.y) < 1.8) this.hurtPlayer(e.dmg, e.pos)
+            const dy = Math.abs(this.ppos.y - e.pos.y)
+            const dodging = this.time - this.dodgeStartT < PERFECT_WIN
+            if (dist < e.reach + PLAYER_R + 0.3 && dy < 1.8) {
+              if (dodging) this.perfectDodge(e)
+              else this.hurtPlayer(e.dmg, e.pos)
+            } else if (dodging && dist < e.reach + PLAYER_R + 3 && dy < 2.4) this.perfectDodge(e)
             if (e.kind === 'brute') {
               this.shake = Math.max(this.shake, 0.45)
               this.spawnBurst(e.pos, e.reach, new THREE.Color(cfg.color))
@@ -1806,6 +1924,20 @@ export class GameEngine {
     // timers
     this.specialCd = Math.max(0, this.specialCd - dt)
     this.dodgeCd = Math.max(0, this.dodgeCd - dt)
+    if (this.dodgeCharges < DODGE_CHARGES) {
+      this.dodgeRecharge += dt
+      if (this.dodgeRecharge >= DODGE_RECHARGE) {
+        this.dodgeRecharge = 0
+        this.dodgeCharges++
+      }
+    } else this.dodgeRecharge = 0
+    this.counterT = Math.max(0, this.counterT - dt)
+    if (this.slowmo > 0) {
+      this.slowmo -= rawDt
+      if (this.slowmo <= 0) this.container.classList.remove('slowmo')
+    }
+    /** czas świata (wrogowie, zagrożenia, pociski) — zwalnia po perfekcyjnym uniku */
+    const wdt = this.slowmo > 0 ? dt * SLOWMO_SCALE : dt
     this.iframes = Math.max(0, this.iframes - dt)
     this.comboTimer = Math.max(0, this.comboTimer - dt)
     this.playerFlash = Math.max(0, this.playerFlash - dt)
@@ -1850,6 +1982,7 @@ export class GameEngine {
         if (this.actionT >= this.actionDur) {
           const was = this.action
           this.action = 'none'
+          if (was !== 'dodge') this.counterAction = false
           this.actionT = 0
           if (was === 'light') {
             this.combo = (this.combo + 1) % 3
@@ -1878,7 +2011,7 @@ export class GameEngine {
     // waves
     if (!this.gameOver && !this.loading) {
       if (this.toSpawn.length) {
-        this.spawnTimer -= dt
+        this.spawnTimer -= wdt
         if (this.spawnTimer <= 0) {
           this.spawnEnemy(this.toSpawn.shift()!)
           this.spawnTimer = Math.max(0.25, 0.9 - this.wave * 0.05)
@@ -1903,7 +2036,7 @@ export class GameEngine {
       if (!this.levelDone) this.stats.time += dt
     }
     this.updatePortal(dt)
-    this.updateHazards(dt)
+    this.updateHazards(wdt)
     if (this.hintT > 0) {
       this.hintT -= rawDt
       if (this.hintT <= 0) {
@@ -1911,9 +2044,10 @@ export class GameEngine {
         this.emitHud(true)
       }
     }
-    this.updateEnemies(dt)
+    this.updateEnemies(wdt)
     this.updateHeals(dt)
-    this.updateProjectiles(dt)
+    this.updateCoins(dt)
+    this.updateProjectiles(wdt)
     this.updateVfx(dt)
 
     if (this.bannerT > 0) {
@@ -1970,7 +2104,11 @@ export class GameEngine {
       maxHp: this.maxHp,
       special: this.specialCd,
       specialMax: this.spec.superCd,
-      dodge: this.dodgeCd,
+      dodge: this.dodgeCharges,
+      dodgeT: this.dodgeCharges >= DODGE_CHARGES ? 1 : this.dodgeRecharge / DODGE_RECHARGE,
+      dodgeMax: DODGE_CHARGES,
+      counter: this.counterT > 0,
+      coins: this.coinMeshes.filter((m) => m.visible).length,
       wave: this.wave,
       kills: this.kills,
       score: this.score,
@@ -2013,6 +2151,10 @@ export class GameEngine {
     this.queuedAttack = false
     this.specialCd = 0
     this.dodgeCd = 0
+    this.dodgeCharges = DODGE_CHARGES
+    this.slowmo = 0
+    this.counterT = 0
+    this.container.classList.remove('slowmo')
     this.iframes = 1
     this.wave = 0
     this.newLevel(1)

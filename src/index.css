@@ -494,3 +494,15 @@ table.history { width: 100%; border-collapse: collapse; background: rgba(7,6,13,
   .game-exit { right: 12px; padding: 5px 10px; }
   .game-model-tag { display: none; }
 }
+
+/* uniki: ładunki, kontra, zwolnienie czasu */
+.hud-cd .pips { display: flex; gap: 5px; }
+.hud-cd .pips em { width: 9px; height: 9px; border-radius: 50%; border: 1px solid rgba(255,255,255,.5); background: transparent; }
+.hud-cd .pips em.on { background: var(--el); box-shadow: 0 0 6px var(--el); border-color: var(--el); }
+.hud-cd.counter { border-color: #9ff4ff; box-shadow: 0 0 16px #9ff4ff; animation: counterPulse .4s ease-in-out infinite alternate; }
+.hud-cd.counter small { color: #9ff4ff; }
+@keyframes counterPulse { to { box-shadow: 0 0 4px #9ff4ff; } }
+.dmg.perfect { font-size: 24px; letter-spacing: .08em; color: #dffcff; white-space: nowrap; text-shadow: 0 0 16px #5fe6ff, 0 2px 0 #000; }
+.game-mount.slowmo canvas { filter: saturate(.55) contrast(1.08) hue-rotate(-12deg); transition: filter .15s; }
+.game-mount canvas { transition: filter .35s; }
+.game-mount.slowmo::before { content: ''; position: absolute; inset: 0; pointer-events: none; z-index: 2; box-shadow: inset 0 0 160px rgba(95,230,255,.45); }

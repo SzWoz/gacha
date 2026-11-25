@@ -502,6 +502,69 @@ export function decorateNature(ctx: DecorCtx): Decor {
     }
   }
 
+  // ── arktyka / wulkan: kry lodowe i obsydianowe półki + gejzery / wyloty magmy ─
+  if (biome === 'arctic' || biome === 'volcano') {
+    const ice = biome === 'arctic'
+    const slabMat = T(
+      ice
+        ? new THREE.MeshStandardMaterial({ color: 0xd8eefc, roughness: 0.15, metalness: 0.1, transparent: true, opacity: 0.92, flatShading: true })
+        : new THREE.MeshStandardMaterial({ color: 0x1c1416, roughness: 0.35, metalness: 0.3, flatShading: true }),
+    )
+    const glowMat = T(new THREE.MeshBasicMaterial({ color: ice ? 0x9fe8ff : 0xff5a10 }))
+    for (const d of decks) {
+      const along = d.cells[0][0] !== d.cells[1][0]
+      const sx = along ? CELL * 2 : CELL
+      const sz = along ? CELL : CELL * 2
+      const g = new THREE.Group()
+      const slab = new THREE.Mesh(T(new THREE.BoxGeometry(sx + 0.3, 0.7, sz + 0.3)), slabMat)
+      slab.position.y = -0.35
+      slab.castShadow = true
+      slab.receiveShadow = true
+      g.add(slab)
+      // świecąca krawędź
+      const rim = new THREE.Mesh(T(new THREE.BoxGeometry(sx + 0.42, 0.08, sz + 0.42)), glowMat)
+      rim.position.y = -0.04
+      g.add(rim)
+      // sople / stalaktyty żaru pod spodem
+      const coneMat = ice ? slabMat : T(new THREE.MeshStandardMaterial({ color: 0x2a1a16, emissive: 0x5a1400, emissiveIntensity: 0.8, flatShading: true }))
+      for (let k = 0; k < 14; k++) {
+        const len = 0.8 + rng() * 2.4
+        const c = new THREE.Mesh(T(new THREE.ConeGeometry(0.18 + rng() * 0.25, len, 5)), coneMat)
+        c.rotation.x = Math.PI
+        c.position.set((rng() - 0.5) * sx, -0.7 - len / 2, (rng() - 0.5) * sz)
+        g.add(c)
+      }
+      // filary podtrzymujące
+      for (const [px, pz] of [[-1, -1], [1, 1]]) {
+        const h = d.y - 0.7
+        const col = new THREE.Mesh(T(new THREE.CylinderGeometry(0.35, 0.5, h, 6)), ice ? slabMat : coneMat)
+        col.position.set(px * (sx / 2 - 0.6), -0.7 - h / 2, pz * (sz / 2 - 0.6))
+        g.add(col)
+      }
+      g.position.copy(d.center)
+      add(g)
+    }
+    // wyrzutnie: gejzer pary / wylot magmy z pulsującą kolumną
+    const ventMat = T(new THREE.MeshStandardMaterial({ color: ice ? 0x9fb8cc : 0x2a1c18, roughness: 0.9, flatShading: true }))
+    const plumeMat = T(new THREE.MeshBasicMaterial({ color: ice ? 0xeaf8ff : 0xff7a20, transparent: true, opacity: 0.35, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }))
+    for (const p of pads) {
+      const ring = add(new THREE.Mesh(T(new THREE.TorusGeometry(0.9, 0.3, 6, 10)), ventMat))
+      ring.rotation.x = Math.PI / 2
+      ring.position.copy(p.pos).setY(p.pos.y + 0.15)
+      const core = add(new THREE.Mesh(T(new THREE.CircleGeometry(0.75, 12)), glowMat))
+      core.rotation.x = -Math.PI / 2
+      core.position.copy(p.pos).setY(p.pos.y + 0.12)
+      const plume = add(new THREE.Mesh(T(new THREE.CylinderGeometry(0.4, 0.8, 3, 12, 1, true)), plumeMat))
+      plume.position.copy(p.pos).setY(p.pos.y + 1.6)
+      const ph = rng() * 6
+      updaters.push((t) => {
+        const k = 0.6 + Math.abs(Math.sin(t * 1.6 + ph)) * 0.6
+        plume.scale.set(1, k, 1)
+        plume.position.y = p.pos.y + 0.2 + 1.5 * k
+      })
+    }
+  }
+
   // ── rośliny / drzewa / kryształy na placach ──────────────
   const underDeck = (i: number, j: number) => decks.some((d) => d.cells.some(([a, b]) => a === i && b === j))
   const plaza = walk.filter(([i, j]) => (MAP[j][i] === 'P' || MAP[j][i] === '.') && ground(i, j) === Ground.Normal && !underDeck(i, j) && !pads.some((p) => p.i === i && p.j === j))

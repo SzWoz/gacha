@@ -50,7 +50,7 @@ export interface Box {
 }
 
 /** Wypycha okrąg (p, r) z prostokątów; prostokąty niższe niż stopy (p.y) + `step` są pomijane. */
-export function pushOutOfBoxes(p: THREE.Vector3, r: number, boxes: Box[], step = 0.45) {
+export function pushOutOfBoxes(p: THREE.Vector3, r: number, boxes: Box[], step = 0.5) {
   let hit = false
   for (const b of boxes) {
     if (p.x < b.minX - r || p.x > b.maxX + r || p.z < b.minZ - r || p.z > b.maxZ + r) continue
